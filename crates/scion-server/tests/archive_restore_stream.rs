@@ -378,57 +378,35 @@ fn empty_archive() -> std::path::PathBuf {
     out
 }
 
-/// A restore in its own process, whose exact peak RSS the kernel
-/// hands back with the reaped child: wait4's rusage, `ru_maxrss` in
-/// KiB on Linux. No sampling, no race - a short process's peak is as
-/// exact as a long one's.
+/// A restore in its own process, whose exact peak RSS the child
+/// prints at its very end: the restore subcommand's measurement seam
+/// (`SCION_TEST_RESTORE_PEAK`, test-hooks only) reads the kernel's own
+/// high-water mark (`VmHWM`, KiB) when the run is over - no sampling,
+/// no race, a short process's peak as exact as a long one's.
 #[cfg(target_os = "linux")]
 fn restore_sampled(archive: &std::path::Path, target: &std::path::Path) -> u64 {
-    use std::io::Read as _;
-
     std::fs::create_dir_all(target).unwrap();
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
         .arg("--data")
         .arg(target)
         .arg("restore")
         .arg("--archive")
         .arg(archive)
+        .env("SCION_TEST_RESTORE_PEAK", "1")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn()
+        .output()
         .unwrap();
-    // The pipes are drained while wait4 holds the reap, so a chatty
-    // child cannot wedge on a full pipe: the child's stderr is the
-    // failure text this function reports.
-    let mut stderr = child.stderr.take().unwrap();
-    let stderr_pipe = std::thread::spawn(move || {
-        let mut text = String::new();
-        let _ = stderr.read_to_string(&mut text);
-        text
-    });
-    let mut stdout_pipe = child.stdout.take().unwrap();
-    std::thread::spawn(move || {
-        let mut sink = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut sink);
-    });
-    let mut status = 0_i32;
-    let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
-    // The pid is ours to wait for; EINTR would leave the child
-    // unreaped, so retry it.
-    let wait = loop {
-        let got = unsafe { libc::wait4(child.id() as libc::pid_t, &mut status, 0, &mut rusage) };
-        if got >= 0 {
-            break got;
-        }
-    };
-    assert_eq!(
-        wait as u32,
-        child.id(),
-        "wait4 reaped another process's child"
+    assert!(
+        output.status.success(),
+        "the restore failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    let ok = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
-    let stderr = stderr_pipe.join().unwrap();
-    assert!(ok, "the restore failed:\n{stderr}");
-    // Linux answers ru_maxrss in KiB.
-    rusage.ru_maxrss as u64
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let peaks: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("restore: peak RSS "))
+        .collect();
+    assert_eq!(peaks.len(), 1, "the child named its peak once: {stdout}");
+    peaks[0].trim().parse().unwrap_or(0)
 }

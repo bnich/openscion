@@ -577,6 +577,24 @@ async fn restore_command(
         report.refs,
         report.lands
     );
+    // The RSS ceiling's measurement seam (test-hooks only): at the very
+    // end, the process reads its own high-water mark - the kernel's
+    // exact peak RSS of this run, race-free because the reader is the
+    // process that lived it. The ceiling test parses this line from the
+    // child's stderr; a default build never reads the environment.
+    #[cfg(all(target_os = "linux", any(test, feature = "test-hooks")))]
+    if std::env::var_os("SCION_TEST_RESTORE_PEAK").is_some() {
+        let status = std::fs::read_to_string("/proc/self/status")
+            .context("cannot read /proc/self/status")?;
+        for line in status.lines() {
+            if let Some(kb) = line.strip_prefix("VmHWM:") {
+                println!(
+                    "restore: peak RSS {} kB",
+                    kb.trim().trim_end_matches("kB").trim()
+                );
+            }
+        }
+    }
     Ok(())
 }
 
