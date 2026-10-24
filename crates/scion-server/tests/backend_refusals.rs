@@ -764,7 +764,11 @@ fn a_lost_marker_written_back_as_the_runbook_says_reopens_the_store() {
     let marker = dir.path().join("backend");
     let out = Command::new("sh")
         .arg("-c")
-        .arg(format!("printf 'postgres\\n{}\\n' > {}", uuid, marker.display()))
+        .arg(format!(
+            "printf 'postgres\\n{}\\n' > {}",
+            uuid,
+            marker.display()
+        ))
         .status()
         .expect("the runbook's printf runs");
     assert!(out.success(), "the runbook's printf wrote the marker");
