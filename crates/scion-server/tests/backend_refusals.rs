@@ -755,10 +755,12 @@ fn a_lost_marker_written_back_as_the_runbook_says_reopens_the_store() {
     assert!(message.contains("carries no marker"), "{message}");
     // The runbook: the UUID comes from the error text - the 32 hex
     // digits it names - and the marker is the printf of two lines.
-    // PROOF-INJECTION: the runbook's wrong-format write - 32 letters
-    // that are not hex digits - must leave the store closed.
-    let uuid: String = "z".repeat(32);
-    assert!(!uuid.bytes().all(|b| b.is_ascii_hexdigit()), "{message}");
+    let start = message
+        .find("names the store ")
+        .expect("the refusal names the store")
+        + "names the store ".len();
+    let uuid = &message[start..start + 32];
+    assert!(uuid.bytes().all(|b| b.is_ascii_hexdigit()), "{message}");
     let marker = dir.path().join("backend");
     let out = Command::new("sh")
         .arg("-c")
