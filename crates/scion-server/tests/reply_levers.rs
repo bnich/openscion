@@ -22,9 +22,11 @@ const TOKEN: &str = "secret";
 /// Names in the head changeset: a page of the diff is over the h2 send
 /// buffer, so an unread reply parks in the server and holds its share.
 const NAMES: usize = 40_000;
-/// Parked replies before the count must have refused: the default
-/// budget is 128 MiB and one parked reply is about 6 MB, so a dozen
-/// cross it. A run that parks this many without a refusal never will.
+/// Parked replies before the count must have refused: the child runs
+/// a 600 KB budget (`spawn_server` sets `SCION_TEST_REPLY_BUDGET`), and
+/// one parked reply's hold is the HTTP/2 window it fills, a fraction
+/// of that budget. Five parked replies crossed it in the runs; a run
+/// that parks this many more without a refusal never will.
 const PARK_CAP: usize = 60;
 
 fn author() -> IdentityTime {
