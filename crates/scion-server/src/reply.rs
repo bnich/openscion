@@ -128,13 +128,7 @@ where
 
     fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
         let budget = Arc::clone(&self.budget);
-        #[cfg_attr(
-            not(any(test, feature = "test-hooks")),
-            expect(
-                unused_variables,
-                reason = "the path names a reply only in the test seam"
-            )
-        )]
+        #[cfg(any(test, feature = "test-hooks"))]
         let path = request.uri().path().to_owned();
         let future = self.inner.call(request);
         // MUTATION levers for the tests' red proofs: "uncounted" never

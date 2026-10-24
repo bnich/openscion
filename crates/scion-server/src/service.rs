@@ -1968,7 +1968,7 @@ impl Scion for ScionService {
                         None => Err(crate::Error::NotFound(format!("path {path:?}"))),
                     },
                 })?;
-                let size = store.read(|c| c.get_tree_body(dir_id))?.len();
+                let size = store.read(|c| c.tree_size(dir_id))?;
                 Ok((dir_id, size))
             })
             .await?;
