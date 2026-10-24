@@ -450,6 +450,10 @@ jobs:
           PROPTEST_CASES: "64"
           SCION_TEST_BACKEND: postgres
           SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+          # TEMPORARY seed pin: each matrix cell replays the seed of the
+          # flake it used to fail on (run 40131180219). Reverted before
+          # the PR.
+          SCION_LANDMODEL_SEED: ${{ matrix.version == '16.15' && '1273923143' || '1626443366' }}
           # The backup test dumps the live metadata with the job's own
           # Postgres, so its tools match the server: the container name
           # points at the service container above, and the test never
