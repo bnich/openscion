@@ -233,7 +233,7 @@ pub struct ServeOptions {
     pub audit: crate::audit::Audit,
     /// The bytes of unary replies the server holds at once. The tests
     /// shrink it, so a small store can exercise the budget; the default
-    /// is the shipped [`REPLY_MEMORY_BUDGET`].
+    /// is the shipped [`crate::reply::REPLY_MEMORY_BUDGET`].
     pub reply_memory_budget: usize,
 }
 
