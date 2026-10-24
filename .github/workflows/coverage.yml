@@ -435,10 +435,12 @@ jobs:
           "$pd" merge -sparse target/coverage/*.profraw \
             -o target/coverage/merged.profdata
           "$pd" show --all-functions target/coverage/merged.profdata \
-            | grep -E '^[^ ].*:$' | sed 's/:$//' | sort -u \
+            | grep -E '^ +[^ ].*:$' | sed 's/^ *//; s/:$//' \
+            | grep -vE '^(Counters|Function counts|Functions shown|Total functions|Maximum function count|Maximum internal block count)$' \
+            | sort -u \
             > target/coverage/all-fn.txt
           lcv="$(find "$(rustc --print sysroot)" -name llvm-cov -type f | head -1)"
-          objects=$(find target/coverage/debug -maxdepth 1 -type f -perm -u+x \
+          objects=$(find target/coverage/debug -type f -perm -u+x \
             ! -name '*.d' ! -name '*.rlib' ! -name '*.so' | tr '\n' ' ')
           # shellcheck disable=SC2086
           "$lcv" export $objects \
@@ -457,6 +459,8 @@ jobs:
             | awk '{print $1}' | sort | uniq -c | sort -rn | head -15
           echo "the dropped set, first 10 names:"
           head -10 target/coverage/unmapped-fn.txt
+          echo "the mapped set, first 3 names, for format comparison:"
+          head -3 target/coverage/mapped-fn.txt
           # Guard 1: counters the report could not map are dropped
           # silently into a warning. That is how the split lost the
           # whole Postgres side while the total read 84.86% (run
