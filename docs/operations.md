@@ -724,8 +724,8 @@ the scratch of a run that died mid-replay, never a store. Keep nothing
 under that name, and rename a leftover into place (the way out above)
 before you start the next restore.
 
-Proof: crates/scion-server/tests/archive_attacks.rs::a_restore_at_a_stopped_stores_url_refuses_and_leaves_it_whole
-Proof: crates/scion-server/tests/archive_attacks.rs::a_restored_store_does_not_carry_the_mark_and_a_later_restore_refuses
+Proof: crates/scion-server/tests/archive_attacks.rs::a_restore_at_a_stopped_stores_url_refuses_and_leaves_it_whole (behaviour, no command: the proof arms a crafted archive against a stopped store's own URL, which no guide command reproduces)
+Proof: crates/scion-server/tests/archive_attacks.rs::a_restored_store_does_not_carry_the_mark_and_a_later_restore_refuses (behaviour, no command: the proof replays a zero-repo archive and writes into the restored store, which no guide command reproduces)
 
 ## 4. Upgrades
 

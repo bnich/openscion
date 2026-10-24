@@ -391,7 +391,7 @@ jobs:
     # The tier job is pull_request-shaped, so on a dispatch it is
     # skipped: the ceiling runs anyway, the way lint does.
     if: >-
-      ${{ github.event_name != 'pull_request' && (needs.tier.result == 'success' || needs.tier.result == 'skipped') }}
+      ${{ !cancelled() && (github.event_name != 'pull_request' && (needs.tier.result == 'success' || needs.tier.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
