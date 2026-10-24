@@ -482,20 +482,28 @@ jobs:
       # and the from-mount suite, which the default build compiles out.
       - run: cargo test -p open-scion --features unstable-writable-mount
       # The release profile never builds the feature, so a default
-      # release scn holds no write symbol of the VFS crate: the write
-      # path is compiled out, not switched off. nm fails the job if
-      # one shows up. The pattern is the VFS crate's mangled module
-      # path with a write name - on the feature build it matches 7
-      # symbols today, so the check has teeth (the fn name itself is
-      # inlined and would prove nothing).
+      # release scn holds none of the write path's own symbols: the
+      # path is compiled out, not switched off. Both sides are
+      # asserted, so the pattern cannot quietly match nothing: the
+      # default build must match 0, the feature build at least 1. The
+      # pattern names the write path's own functions (write_file,
+      # write_deletes): the NFS trait's write name matches the ROFS
+      # stub every build carries, and the nodes lock's write is taken
+      # on read paths too, so neither proves anything.
       - run: |
           cargo build -p open-scion --release
-          if nm target/release/scn | grep 'open_scion3vfs' | grep -qiE 'write'; then
-            echo "the default release scn carries a VFS write symbol" >&2
-            nm target/release/scn | grep 'open_scion3vfs' | grep -iE 'write' >&2
+          default=$(nm target/release/scn | grep -cE '3vfs(10write_file|13write_deletes)')
+          cargo build -p open-scion --release --features unstable-writable-mount
+          feat=$(nm target/release/scn | grep -cE '3vfs(10write_file|13write_deletes)')
+          echo "write-path symbols: default=$default feature=$feat"
+          if [ "$default" != 0 ]; then
+            echo "the default release scn carries a write-path symbol" >&2
             exit 1
           fi
-          echo "the default release scn has no VFS write symbol"
+          if [ "$feat" -lt 1 ]; then
+            echo "the feature build lost its write-path symbols; the check is blind" >&2
+            exit 1
+          fi
 
   test-macos:
     name: test (macOS)
