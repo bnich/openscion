@@ -260,6 +260,15 @@ fn a_big_restore_stays_under_its_rss_ceiling() {
         &empty_archive(),
         &tempfile::tempdir().unwrap().path().join("restored-empty"),
     );
+    // The twin's process is short; a sampler that lost the race answers
+    // a startup page count, not a footprint, and the bound under it
+    // would refuse every honest restore. A real Rust binary with a
+    // runtime holds megabytes.
+    assert!(
+        baseline_kb >= 8 * 1024,
+        "the twin's baseline sampled {baseline_kb} kB - the sampler lost \
+         the process before it grew; this test needs /proc (Linux)"
+    );
     let target = tempfile::tempdir().unwrap().path().join("restored");
     let peak_kb = restore_sampled(&out, &target);
     println!(
@@ -388,6 +397,9 @@ fn restore_sampled(archive: &std::path::Path, target: &std::path::Path) -> u64 {
     let sampler = std::thread::spawn(move || {
         let status = format!("/proc/{pid}/status");
         let mut last = 0_u64;
+        // VmHWM is the kernel's high-water mark: any read while the
+        // process lives answers the max so far, so the only race is
+        // the process dying between reads - poll fast.
         while let Ok(text) = std::fs::read_to_string(&status) {
             for line in text.lines() {
                 if let Some(kb) = line.strip_prefix("VmHWM:")
@@ -396,7 +408,7 @@ fn restore_sampled(archive: &std::path::Path, target: &std::path::Path) -> u64 {
                     last = last.max(kb);
                 }
             }
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(1));
         }
         last
     });
