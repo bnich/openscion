@@ -1,20 +1,25 @@
 //! The server's RSS stays bounded while many clients hold unread
-//! `ListDir` replies at once: the reply budget counts the whole body
-//! before it is built, so a spent budget refuses instead of building.
-//! Red before the rule: the old order built the body first and took
-//! its share after, so every concurrent build sat in RAM uncounted
-//! (the `whole_share` shortcut this suite retires).
+//! `ListDir` replies at once: the whole-object share is taken from the
+//! stored tree body's length BEFORE the body is built, so a spent read
+//! budget queues or refuses a build it cannot pay for. Red before the
+//! rule: the old order built the body first and took its share after,
+//! so every concurrent build sat in RAM uncounted (the `whole_share`
+//! shortcut this suite retires).
+//!
+//! The budget that pays for a `ListDir` reply is the READ budget
+//! (`READ_BUDGET_BYTES`, 256 MiB), not the unary reply budget: the
+//! reply streams, so the reply-memory layer skips it.
 //!
 //! Needs `/proc` (Linux): the measurement is the child server's
 //! `VmRSS`.
 
 #![cfg(target_os = "linux")]
 
-use prost::Message as _;
 use scion_core::{Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_proto::runtime::auth::Bearer;
 use scion_proto::v1::ListDirRequest;
 use scion_proto::v1::scion_client::ScionClient;
+use scion_server::test_support::meta::MetaTx;
 use scion_server::test_support::store::Store;
 
 mod common;
@@ -23,15 +28,24 @@ const REPO: &str = "main";
 const TOKEN: &str = "secret";
 
 /// One directory wide enough that one `ListDir` reply's tree body is
-/// about `names * 160` bytes; 13,000 names of 120 characters is about
-/// 2 MB.
+/// about 2 MB (13,000 entries of 120 characters).
 const NAMES: usize = 13_000;
-/// Held unread streams: 120 bodies of 2 MB is 240 MB of builds under
-/// the old order, well over the 128 MiB budget.
-const STREAMS: usize = 120;
-/// The slack over baseline plus the budget: allocator churn, the
+/// Held unread streams: 200 bodies of about 2 MB is about 416 MB, at
+/// least 1.5x the 256 MiB read budget, so the right order MUST queue
+/// some builds and the old order MUST pass the ceiling.
+const STREAMS: usize = 200;
+/// The streams ride 8 connections: 25 replies of 2 MB is about 50 MB
+/// per connection, under the 64 MiB stalled-bytes cap that would
+/// otherwise close a connection and free what it holds - the test must
+/// measure the read budget, not the stall cap.
+const CONNECTIONS: usize = 8;
+/// The slack over baseline plus the read budget: allocator churn, the
 /// worker's own buffers, tonic's frames.
 const SLACK_KB: u64 = 48 * 1024;
+/// A call whose share queues waits for a held body that its client
+/// never reads, so it parks until this timeout. A parked call is the
+/// design: the budget queues the build, it does not skip it.
+const OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 fn author() -> IdentityTime {
     IdentityTime::new(b"t".to_vec(), b"t@x".to_vec(), 1_700_000_000, 0)
@@ -69,20 +83,36 @@ fn seed(dir: &std::path::Path) -> ChangesetId {
     store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
-            c.insert_changeset(repo, changeset)
+            c.insert_changeset(repo, &changeset)
         })
         .unwrap()
 }
 
-/// The child server's `VmRSS` in kB; 0 when it is gone.
+/// The child server's resident set in kB, from `/proc` where it
+/// exists and from `ps` where it does not; 0 when neither answers.
 fn rss_kb(pid: u32) -> u64 {
     let status = format!("/proc/{pid}/status");
-    std::fs::read_to_string(status).ok().and_then(|text| {
-        text.lines().find_map(|line| {
-            line.strip_prefix("VmRSS:")
+    if let Ok(text) = std::fs::read_to_string(status) {
+        for line in text.lines() {
+            if let Some(kb) = line
+                .strip_prefix("VmRSS:")
                 .and_then(|kb| kb.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            {
+                return kb;
+            }
+        }
+    }
+    std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .and_then(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse::<u64>()
+                .ok()
         })
-    })
+        .unwrap_or(0)
 }
 
 /// A running real `scion-server` on the seeded store.
@@ -100,7 +130,7 @@ impl Drop for Server {
 
 fn serve(dir: &std::path::Path) -> Server {
     let log = std::fs::File::create(dir.join("server.log")).unwrap();
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
         .arg("--data")
         .arg(dir)
         .args(["serve", "--token", TOKEN, "--listen", "127.0.0.1:0"])
@@ -108,8 +138,8 @@ fn serve(dir: &std::path::Path) -> Server {
         .env_remove("RUST_LOG")
         // The mutation lever rides through to the child, for the red.
         .env(
-            "SCION_LISTDIR_MUTATION",
-            std::env::var("SCION_LISTDIR_MUTATION").unwrap_or_default(),
+            "SCION_TEST_LISTDIR_MUTATION",
+            std::env::var("SCION_TEST_LISTDIR_MUTATION").unwrap_or_default(),
         )
         .stdout(std::process::Stdio::from(log.try_clone().unwrap()))
         .stderr(std::process::Stdio::from(log))
@@ -136,7 +166,7 @@ fn bound_addr(log: &std::path::Path) -> Option<std::net::SocketAddr> {
     let text = std::fs::read_to_string(log).ok()?;
     text.lines()
         .filter(|line| line.contains("serving"))
-        .filter_map(|line| line.split("listen=").next_back())
+        .filter_map(|line| line.rsplit("listen=").next())
         .next_back()
         .and_then(|addr| addr.split_whitespace().next())
         .and_then(|addr| addr.parse().ok())
@@ -145,39 +175,76 @@ fn bound_addr(log: &std::path::Path) -> Option<std::net::SocketAddr> {
 #[tokio::test(flavor = "multi_thread")]
 async fn held_list_dir_replies_stay_under_the_budget_in_rss() {
     let dir = tempfile::tempdir().unwrap();
-    seed(dir.path());
+    let changeset = seed(dir.path());
+    let changeset_bytes = changeset.as_bytes().to_vec();
     let server = serve(dir.path());
 
-    let mut client = ScionClient::with_interceptor(
-        common::channel(&format!("http://{}", server.addr))
-            .await
-            .unwrap(),
-        Bearer::new(TOKEN).unwrap(),
-    );
     let baseline_kb = rss_kb(server.child.id());
     assert!(
         baseline_kb > 0,
         "the sampler saw no RSS; this test needs /proc"
     );
 
-    let mut held = Vec::new();
-    for _ in 0..STREAMS {
-        let request = ListDirRequest {
-            repo: REPO.into(),
-            changeset_id: Vec::new(),
-            path: Vec::new(),
-        };
-        held.push(client.list_dir(request).await.expect("list_dir opens"));
-        // Hold the stream: its reply is never read.
+    // The streams ride several connections, under each one's
+    // stalled-bytes cap, so the read budget is the only bound at work.
+    let mut clients = Vec::new();
+    for _ in 0..CONNECTIONS {
+        let client = ScionClient::with_interceptor(
+            common::channel(&format!("http://{}", server.addr))
+                .await
+                .unwrap(),
+            Bearer::new(TOKEN).unwrap(),
+        );
+        clients.push(client);
     }
+
+    // Open every stream at once: the first builds take their shares
+    // and hold their bodies; the rest park on the spent budget until
+    // the open timeout. A parked call is the design, not a failure.
+    let mut tasks = tokio::task::JoinSet::new();
+    for i in 0..STREAMS {
+        let changeset_bytes = changeset_bytes.clone();
+        let mut client = clients[i % CONNECTIONS].clone();
+        tasks.spawn(async move {
+            let request = ListDirRequest {
+                repo: REPO.into(),
+                changeset_id: changeset_bytes.clone(),
+                path: Vec::new(),
+            };
+            let opened = tokio::time::timeout(OPEN_TIMEOUT, client.list_dir(request)).await;
+            if let Ok(Ok(response)) = opened {
+                let stream = response.into_inner();
+                // Hold the stream: its reply is never read. The
+                // hold outlives the measurement below; the timeout
+                // keeps a client that would wait forever moving.
+                let _ = tokio::time::timeout(OPEN_TIMEOUT, std::future::pending::<()>()).await;
+                drop(stream);
+                true
+            } else {
+                false
+            }
+        });
+    }
+    let opened = tasks.join_all().await;
+    let held = opened.iter().filter(|held| **held).count();
+    println!("{held} of {STREAMS} streams hold replies; the rest parked");
 
     // Every opened call either built its body (budget-paid) or was
     // refused; give the builds a moment to land, then measure.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    let after_kb = rss_kb(server.child.id()).expect("the server stays up");
-    let budget_kb = (scion_server::REPLY_MEMORY_BUDGET / 1024) as u64;
+    let after_kb = rss_kb(server.child.id());
+    assert!(after_kb > 0, "the server stays up and reports its RSS");
+    let budget_kb = (scion_server::READ_BUDGET_BYTES / 1024) as u64;
     let ceiling = baseline_kb + budget_kb + SLACK_KB;
-    println!("baseline {baseline_kb} kB, after {after_kb} kB, ceiling {ceiling} kB");
+    let floor = baseline_kb + budget_kb / 2;
+    println!(
+        "baseline {baseline_kb} kB, after {after_kb} kB, floor {floor} kB, ceiling {ceiling} kB"
+    );
+    assert!(
+        after_kb >= floor,
+        "the server's RSS ({after_kb} kB) stayed under the floor ({floor} kB); \
+         the holds never spent the budget, so this proves nothing"
+    );
     assert!(
         after_kb <= ceiling,
         "the server's RSS ({after_kb} kB) passed the ceiling ({ceiling} kB); \

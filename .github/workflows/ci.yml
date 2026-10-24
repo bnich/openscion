@@ -365,17 +365,25 @@ jobs:
           fi
       - name: unread ListDir replies stay under the budget, and the old order does not
         run: |
-          # The budget counts a whole tree body before it is built, so
-          # 120 clients holding unread ListDir replies stay inside
-          # baseline + budget. The lever reverts to the old order
-          # (build first, share after) and must blow the bound: the
-          # red that proves the test can fail.
+          # The read budget counts a whole tree body before it is
+          # built, so clients holding unread ListDir replies stay
+          # inside baseline + read budget (+ a transient copy's slack),
+          # and above a floor that says the holds spent the budget.
+          # The lever reverts to the old order (build first, share
+          # after) and must blow the ceiling - and must blow it for the
+          # RSS reason, not by crashing, so the step demands the words.
           cargo test -p open-scion-server --test listdir_rss
-          if SCION_LISTDIR_MUTATION=build_then_share \
-            cargo test -p open-scion-server --test listdir_rss; then
+          if SCION_TEST_LISTDIR_MUTATION=build_then_share \
+            cargo test -p open-scion-server --test listdir_rss \
+            > /tmp/listdir-red.log 2>&1; then
             echo "::error::the old build-then-share order passed the RSS bound"
             exit 1
           fi
+          grep -q "passed the ceiling" /tmp/listdir-red.log || {
+            echo "::error::the lever run failed for another reason:"
+            cat /tmp/listdir-red.log
+            exit 1
+          }
       - name: a real disk full (tmpfs)
         run: cargo test -p open-scion-server --test disk_full
         env:
