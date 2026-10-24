@@ -1,4 +1,4 @@
-//! The daemon's socket path is never followed through a symlink: bind_unix
+//! The daemon's socket path is never followed through a symlink: `bind_unix`
 //! refuses anything at the final component that is not a socket file of
 //! ours, re-binds a stale socket that nothing listens on, and names the
 //! path in every refusal.
@@ -9,7 +9,7 @@ use std::os::unix::net::UnixListener;
 
 use scion_proto::runtime::listen::bind_unix;
 
-fn private_dir(name: &str) -> tempfile::TempDir {
+fn private_dir() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     dir
@@ -19,7 +19,7 @@ fn private_dir(name: &str) -> tempfile::TempDir {
 /// path the directory check never saw.
 #[tokio::test]
 async fn a_symlink_at_the_socket_path_refuses_the_start() {
-    let dir = private_dir("symlink");
+    let dir = private_dir();
     let target = dir.path().join("trap.sock");
     let socket = dir.path().join("daemon.sock");
     std::os::unix::fs::symlink(&target, &socket).unwrap();
@@ -36,7 +36,7 @@ async fn a_symlink_at_the_socket_path_refuses_the_start() {
 /// removed and bound again, as before.
 #[tokio::test]
 async fn a_stale_socket_of_ours_still_restarts() {
-    let dir = private_dir("stale");
+    let dir = private_dir();
     let socket = dir.path().join("daemon.sock");
     UnixListener::bind(&socket).unwrap();
     bind_unix(&socket).await.expect("the stale socket re-binds");
@@ -48,7 +48,7 @@ async fn a_stale_socket_of_ours_still_restarts() {
 /// daemon never writes over a file it did not make.
 #[tokio::test]
 async fn a_regular_file_at_the_socket_path_is_refused() {
-    let dir = private_dir("regular");
+    let dir = private_dir();
     let socket = dir.path().join("daemon.sock");
     std::fs::write(&socket, b"not a socket").unwrap();
     let error = bind_unix(&socket).await.unwrap_err();
