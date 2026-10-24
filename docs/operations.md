@@ -215,7 +215,7 @@ client's `--token` is what it sends, the other side of the pair of the tier
 in front of it.
 
 ```sh
-SCION_TOKEN=<CACHE_TOKEN> SCION_UPSTREAM_TOKEN=<SERVER_TOKEN> \
+SCION_TOKEN=<SERVER_TOKEN> SCION_UPSTREAM_TOKEN=<SERVER_TOKEN> \
   ./scion-cache --upstream http://SERVER:7878 \
   --ticket-public-key <PUBLIC_KEY_HEX>
 ```
@@ -224,9 +224,16 @@ The cache keeps its objects in memory and drops the least recently used
 first: `--max-bytes` (1 GiB) is the most object bytes it holds. A snapshot
 holds at most `--snapshot-bytes` object bytes (256 MiB).
 
-The cache needs `--ticket-public-key` (the hex that `ticket-key` printed):
-without it, it serves no objects. A `scn` user then points reads at the
-cache with `scn checkout --server http://SERVER:7878 --objects http://CACHE:7879`.
+The cache needs `--ticket-public-key` (the hex that `ticket-key` printed),
+and refuses to start without one: a cache that checked no ticket would
+serve every object it holds to any caller that names an object ID. A
+`scn` user then points reads at the cache with
+`scn checkout --server http://SERVER:7878 --objects http://CACHE:7879`.
+
+One token rule the flag list hides (section 2 says it for the daemon
+chain): `scn` sends its one `--token` on every call, to the server and to
+the cache, so the token the user holds must be accepted by both. The
+example gives the cache the same caller token the server holds.
 
 ### Server, cache, and a daemon per user
 

@@ -481,6 +481,42 @@ impl<S: Store> Tier<S> {
         client_tls: Option<&ClientTls>,
         ticket_keys: Vec<ed25519_dalek::VerifyingKey>,
     ) -> anyhow::Result<Self> {
+        // A tier that verifies tickets verifies them on every call: an
+        // empty key list would silently turn the tier into a relay that
+        // serves whatever its store holds, to any caller that names an
+        // object ID. The relay mode is the daemon's explicit choice
+        // (`new_relay`), never inferred from an empty list.
+        anyhow::ensure!(
+            !ticket_keys.is_empty(),
+            "a ticket-verifying tier needs at least one public key (the hex \
+             that `scion-server ticket-key` printed)"
+        );
+        Self::build(store, upstream, upstream_token, timeout, client_tls, ticket_keys)
+    }
+
+    /// The daemon's tier: it relays the ticket its caller presents,
+    /// unverified, and its upstream does the checking (the daemon's
+    /// socket is 0600 in a private directory, so the caller is the one
+    /// OS user that owns the socket).
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn new_relay(
+        store: S,
+        upstream: &str,
+        upstream_token: &str,
+        timeout: Duration,
+        client_tls: Option<&ClientTls>,
+    ) -> anyhow::Result<Self> {
+        Self::build(store, upstream, upstream_token, timeout, client_tls, Vec::new())
+    }
+
+    fn build(
+        store: S,
+        upstream: &str,
+        upstream_token: &str,
+        timeout: Duration,
+        client_tls: Option<&ClientTls>,
+        ticket_keys: Vec<ed25519_dalek::VerifyingKey>,
+    ) -> anyhow::Result<Self> {
         let endpoint = Endpoint::from_shared(upstream.to_owned())
             .with_context(|| format!("bad upstream address {upstream:?}"))?;
         let endpoint = if let Some(client_tls) = client_tls {
@@ -1378,7 +1414,11 @@ impl<S: Store> Objects for Tier<S> {
         .map_err(|why| {
             // The reason only: no ticket bytes, and no signature.
             tracing::warn!(reason = %why, "a GetObjects ticket was refused");
-            Status::permission_denied(format!("bad ticket: {why}"))
+            Status::permission_denied(format!(
+                "bad ticket: {why} (the tier's --ticket-public-key must hold a \
+                 key the server signs with; operations.md section 2's rotation \
+                 keeps the old key alive during a change)"
+            ))
         })?;
         let keys = refs
             .into_iter()
@@ -1655,6 +1695,38 @@ mod tests {
             request_id: None,
             stalled: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_tier_refuses_a_ticket_of_another_key() {
+        use scion_proto::v1::GetObjectsRequest;
+        let setup = setup(1, 1 << 20).await;
+        // A ticket the tier's key did not sign: refused with the key named.
+        let forged = scion_proto::ticket::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+            "r",
+            "test",
+            *setup.root.as_bytes(),
+            scion_proto::ticket::now(),
+        )
+        .unwrap();
+        let request = GetObjectsRequest {
+            ticket: forged,
+            refs: vec![scion_proto::v1::ObjectRef {
+                kind: setup.keys[0].kind() as i32,
+                id: setup.keys[0].id().as_slice().to_vec(),
+                path: setup.paths[0].clone(),
+            }],
+            accept: Vec::new(),
+        };
+        let error = Objects::get_objects(&setup.tier, Request::new(request))
+            .await
+            .unwrap_err();
+        assert!(
+            error.message().contains("unknown key or bad signature"),
+            "the refusal names the signature: {}",
+            error.message()
+        );
     }
 
     #[tokio::test]
@@ -1987,13 +2059,12 @@ mod tests {
                 .add_service(ObjectsServer::new(Stalls(data.to_vec())))
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
-        Tier::new(
+        Tier::new_relay(
             MemoryStore::new(0),
             &url,
             "token",
             CACHE_UPSTREAM_TIMEOUT,
             None,
-            Vec::new(),
         )
         .unwrap()
     }

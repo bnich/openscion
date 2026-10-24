@@ -270,6 +270,13 @@ that breaks one is caught.
   `scion-server/tests/archive_attacks.rs::two_pending_lands_sharing_a_request_key_are_named_or_tolerated`,
   `scion-server/tests/archive_attacks.rs::a_mid_replay_failure_leaves_the_target_empty`,
   `scion-server/tests/archive_attacks.rs::a_pg_replay_that_dies_halfway_leaves_the_database_empty`
+- **A cache verifies every ticket it serves.** The cache refuses to
+  start without a public key, and a call whose ticket the key did not
+  sign is refused before the walk; the unverified relay is the daemon's
+  explicit mode (its 0600 socket already gives it one user). The
+  connection cap, the stream cap and the audit meter's per-address
+  folding bound a refused call the same as any other.
+  `scion-tier/tests/keyless_cache.rs::a_cache_without_a_public_key_does_not_start`
 - **A refused-auth flood is counted by the machine, not the socket.**
   The audit meter folds one peer's refusals into counted lines keyed
   by the address — an IPv6 by its /64, the smallest block one site
