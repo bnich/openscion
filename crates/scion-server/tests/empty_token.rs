@@ -84,19 +84,22 @@ fn a_token_with_a_leading_space_still_authenticates_its_own_bytes() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("data")).unwrap();
     let access = write_access(dir.path(), &expected_digest(" leading space"));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_scion-server"))
-        .args([
-            "--data",
-            dir.path().join("data").to_str().unwrap(),
-            "serve",
-            "--access",
-            access.to_str().unwrap(),
-        ])
-        .env_remove("SCION_TOKEN")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the server starts");
+    let serve = |dir: &std::path::Path, access: &std::path::Path| {
+        Command::new(env!("CARGO_BIN_EXE_scion-server"))
+            .args([
+                "--data",
+                dir.to_str().unwrap(),
+                "serve",
+                "--access",
+                access.to_str().unwrap(),
+            ])
+            .env_remove("SCION_TOKEN")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the server starts")
+    };
+    let mut child = serve(&dir.path().join("data"), &access);
     std::thread::sleep(std::time::Duration::from_secs(2));
     let alive = child.try_wait().expect("the wait works").is_none();
     if !alive {
