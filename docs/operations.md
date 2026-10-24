@@ -57,8 +57,15 @@ git -C /srv/git/my-repo log --oneline -1
 ```
 
 The first import makes the repo (named `main` unless `--repo` says
-otherwise), and a client's `scn log main` reads it back; the import can
-run while the server serves.
+otherwise), and a client reads it back:
+
+```sh
+SCION_SERVER=http://127.0.0.1:7878 scn --token-file /srv/scion-token log main
+```
+
+The client's global flags (`--server`, `--token-file`) go before the
+subcommand; the environment forms are `SCION_SERVER` and `SCION_TOKEN`.
+The import can run while the server serves.
 
 Proof: crates/scion-server/tests/first_boot.rs::a_first_boot_serves_probes_and_reads_back
 
@@ -80,11 +87,18 @@ can change. Without `--ticket-key` no object is readable, so a real server
 adds a ticket key (section 2):
 
 ```sh
-./scion-server ticket-key --out /srv/scion-keys/ticket.key   # prints the public key
+./scion-server --data /srv/scion ticket-key --out /srv/scion-keys/ticket.key \
+  | tee /srv/scion-keys/ticket.pub   # prints the public key
 chmod 600 /srv/scion-keys/ticket.key
 ./scion-server --data /srv/scion serve --token <TOKEN> \
   --ticket-key /srv/scion-keys/ticket.key
 ```
+
+The public key lands in `ticket.pub`, kept for the next rotation's
+`--ticket-key-old` (section 2).
+
+`ticket-key` records its run in the data directory's audit log, so it
+takes the same `--data` as the serve line.
 
 Size the process with the three connection caps: `--max-connections` (128)
 bounds the clients served at once, `--max-streams` (256) bounds the calls
@@ -569,8 +583,10 @@ symlink, or that sits under directories another user can change.
 
 Rotation, step by step:
 
-1. Make the new key: `scion-server ticket-key --out NEW.key` — it prints the
-   new public key as 64 hex characters.
+1. Make the new key, and capture its public key into its own file, kept
+   for the next rotation:
+   `scion-server --data /srv/scion ticket-key --out NEW.key | tee NEW.pub`
+   — it prints the new public key as 64 hex characters.
 2. Give the tiers both public keys, new first, **before** the server moves
    to the new key — a cache that verifies only the old key refuses every
    ticket the new server mints:
@@ -578,10 +594,12 @@ Rotation, step by step:
    flag; two are the most). Restart the caches; a cache that verifies
    against both serves tickets of either key.
 3. Restart the server with both keys: `--ticket-key NEW.key
-   --ticket-key-old OLD-PUBLIC`. The old argument is a file holding the
-   **public** key of the previous key (the hex that the old run printed),
-   not its seed — and the file holds the bare hex and nothing else: 64
-   hex characters, no `name=` prefix, no trailing line. A public key is
+   --ticket-key-old OLD-PUBLIC`. The old argument is the previous key's
+   `.pub` file - the public key that the run which made the **previous**
+   key captured (step 1 the last time), not its seed, and not this
+   rotation's new key. The file's text is trimmed when read, so a
+   trailing newline is fine; what it holds is the bare 64-hex public
+   key and nothing else. A public key is
    not a secret: anyone may read the file, but group and others must not
    be able to WRITE it (a changed key breaks every tier that verifies
    against the old one), it must not be a symlink, and the directories
@@ -783,7 +801,24 @@ re-date such a commit in the git history and import again.
 
 So an upgrade is: stop the server (and any tiers that share the directory —
 none do by default), copy the directory as a backup (section 3), start the
-new binary, watch the log for the migration, run `fsck`. Schema 7 (tree
+new binary, watch the log for the migration, run `fsck`. A store that
+has data logs its migration steps when a build migrates it.
+
+Where the binaries come from. v0.1.0 is a source release: build the
+version you need from its signed tag (`docs/RELEASING.md`):
+
+```sh
+git checkout <tag>
+cargo build --release --locked
+```
+
+A release that ships binaries says so in its release notes, and
+`docs/verify.md` verifies them. Whichever way the binaries came, keep
+the previous build's binaries beside the new ones **before** an
+upgrade: the rollback below needs them, because rebuilding the old tag
+mid-incident needs the toolchain and the time you do not have.
+
+Schema 7 (tree
 entry sizes, `#172`) drops every stored tree and its derived rows, so the
 first queries after it re-derive trees from the stored changesets; the
 blobs and changesets stay. A tier's store may keep tree bytes of the old
