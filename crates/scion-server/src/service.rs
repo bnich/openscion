@@ -337,7 +337,8 @@ pub async fn serve(
         audit.clone(),
         stop_rx,
     ));
-    let reply_memory = crate::reply::ReplyMemoryLayer::with_budget(reply_memory_budget);
+    let reply_memory =
+        crate::reply::ReplyMemoryLayer::with_budget(reply_memory_budget, Arc::clone(&metrics));
     let scion = reply_memory.clone().layer(
         MetricsLayer::new(Arc::clone(&metrics)).layer(InterceptedService::new(
             ScionService::new(
@@ -785,6 +786,18 @@ pub(crate) fn count_reply<M: prost::Message>(response: Response<M>) -> Response<
     response
         .extensions_mut()
         .insert(crate::reply::ReplySize(size));
+    response
+}
+
+/// Marks a committed write's reply so the reply-memory layer never
+/// refuses it: the write has landed, and the client must read the
+/// truth, not a retryable error. The layer sends it uncounted when
+/// the budget is spent, with a warn line.
+pub(crate) fn count_committed_reply<M: prost::Message>(response: Response<M>) -> Response<M> {
+    let mut response = count_reply(response);
+    response
+        .extensions_mut()
+        .insert(crate::reply::ReplyMustDeliver);
     response
 }
 
@@ -1519,7 +1532,7 @@ impl Scion for ScionService {
             })
             .await;
         let id = written??;
-        Ok(count_reply(Response::new(PutBlobResponse {
+        Ok(count_committed_reply(Response::new(PutBlobResponse {
             blob_id: id.as_bytes().to_vec(),
         })))
     }
@@ -1617,9 +1630,11 @@ impl Scion for ScionService {
             })
             .await;
         let id = outcome??;
-        Ok(count_reply(Response::new(CreateChangesetResponse {
-            changeset_id: id.as_bytes().to_vec(),
-        })))
+        Ok(count_committed_reply(Response::new(
+            CreateChangesetResponse {
+                changeset_id: id.as_bytes().to_vec(),
+            },
+        )))
     }
 
     async fn land(
@@ -1746,7 +1761,7 @@ impl Scion for ScionService {
             })
             .await;
         match ran {
-            Ok(Ok(outcome)) => Ok(count_reply(Response::new(land_response(outcome)))),
+            Ok(Ok(outcome)) => Ok(count_committed_reply(Response::new(land_response(outcome)))),
             Ok(Err(status)) => {
                 self.metrics.land(code_label(status.code()));
                 Err(status)

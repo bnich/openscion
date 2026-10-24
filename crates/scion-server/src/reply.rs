@@ -24,6 +24,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use http_body::Body as HttpBody;
+use std::time::Instant;
+
+use scion_proto::runtime::metrics::Metrics;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// The bytes of unary replies the server holds at once, across every
@@ -36,12 +39,14 @@ pub const REPLY_MEMORY_BUDGET: usize = 128 << 20;
 #[derive(Clone)]
 pub(crate) struct ReplyMemoryLayer {
     budget: Arc<Semaphore>,
+    metrics: Arc<Metrics>,
 }
 
 impl ReplyMemoryLayer {
-    pub(crate) fn with_budget(budget: usize) -> Self {
+    pub(crate) fn with_budget(budget: usize, metrics: Arc<Metrics>) -> Self {
         Self {
             budget: Arc::new(Semaphore::new(budget)),
+            metrics,
         }
     }
 
@@ -49,6 +54,7 @@ impl ReplyMemoryLayer {
         ReplyMemoryService {
             inner,
             budget: self.budget,
+            metrics: self.metrics,
         }
     }
 }
@@ -72,6 +78,13 @@ fn refusal(message: &'static str) -> http::Response<tonic::body::Body> {
 /// tonic-encoded body carries no exact size hint).
 #[derive(Clone, Copy)]
 pub(crate) struct ReplySize(pub usize);
+
+/// The mark of a reply that must be delivered even when the budget is
+/// spent: its call changed state, so the write has committed and the
+/// client must read the truth, never a retryable error. The layer
+/// sends such a reply anyway, uncounted; its bytes are a few dozen.
+#[derive(Clone, Copy)]
+pub(crate) struct ReplyMustDeliver;
 
 /// The reply body that holds the budget permit until it ends.
 struct CountedReply<B> {
@@ -99,6 +112,7 @@ impl<B: HttpBody<Data = scion_proto::Bytes> + Unpin + Send + 'static> HttpBody f
 pub(crate) struct ReplyMemoryService<S> {
     inner: S,
     budget: Arc<Semaphore>,
+    metrics: Arc<Metrics>,
 }
 
 impl<S: tonic::server::NamedService> tonic::server::NamedService for ReplyMemoryService<S> {
@@ -128,7 +142,7 @@ where
 
     fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
         let budget = Arc::clone(&self.budget);
-        #[cfg(any(test, feature = "test-hooks"))]
+        let metrics = Arc::clone(&self.metrics);
         let path = request.uri().path().to_owned();
         let future = self.inner.call(request);
         // MUTATION levers for the tests' red proofs: "uncounted" never
@@ -203,12 +217,31 @@ where
                 .try_acquire_many_owned(u32::try_from(size).unwrap_or(u32::MAX))
             {
                 Some(permit)
+            } else if response.extensions().get::<ReplyMustDeliver>().is_some() {
+                // A call that changed state: the write has committed,
+                // and the client must read the truth, never a
+                // retryable error for a write that landed. Sent
+                // uncounted; the reply is a few dozen bytes.
+                tracing::warn!(
+                    path,
+                    size,
+                    "a committed write's reply is over the reply budget: sent uncounted"
+                );
+                None
             } else {
                 // The budget is out: refuse the reply rather
                 // than hold memory no other reply can count
                 // on. The built response is dropped here, so
                 // the refusal frees what it held.
                 tracing::warn!(size, "a unary reply refused: the reply budget is spent");
+                // The outer counting body never sees this reply's
+                // trailers (the status rides in the headers), so it
+                // would record CANCELLED on its drop; the refusal is a
+                // resource_exhausted, and an operator who looks for it
+                // during an incident must find it.
+                if let Some(rpc) = metrics.rpc(&path) {
+                    metrics.request(rpc, 8, Instant::now(), 0, 0);
+                }
                 return Ok(refusal(
                     "the server's reply budget is spent; read what you opened",
                 ));
@@ -248,6 +281,7 @@ mod tests {
         size: u64,
         never_read: bool,
         marked: bool,
+        must_deliver: bool,
     }
 
     impl tower::Service<http::Request<tonic::body::Body>> for FixedReply {
@@ -265,6 +299,9 @@ mod tests {
                 never_read: self.never_read,
             };
             let mut reply = http::Response::new(body);
+            if self.must_deliver {
+                reply.extensions_mut().insert(ReplyMustDeliver);
+            }
             if self.marked {
                 if self.size == 0 {
                     reply.extensions_mut().insert(ReplyStreams);
@@ -316,11 +353,13 @@ mod tests {
         let budget = Arc::new(Semaphore::new(1_000));
         let mut service = ReplyMemoryLayer {
             budget: Arc::clone(&budget),
+            metrics: Arc::new(Metrics::default()),
         }
         .layer(FixedReply {
             size: 400,
             never_read: false,
             marked: true,
+            must_deliver: false,
         });
         let response = service.call(request()).await.unwrap();
         assert_eq!(
@@ -343,11 +382,13 @@ mod tests {
         let budget = Arc::new(Semaphore::new(1_000));
         let mut service = ReplyMemoryLayer {
             budget: Arc::clone(&budget),
+            metrics: Arc::new(Metrics::default()),
         }
         .layer(FixedReply {
             size: 400,
             never_read: true,
             marked: true,
+            must_deliver: false,
         });
         let response = service.call(request()).await.unwrap();
         assert_eq!(budget.available_permits(), 600);
@@ -364,22 +405,26 @@ mod tests {
         let budget = Arc::new(Semaphore::new(1_000));
         let mut holder = ReplyMemoryLayer {
             budget: Arc::clone(&budget),
+            metrics: Arc::new(Metrics::default()),
         }
         .layer(FixedReply {
             size: 1_000,
             never_read: true,
             marked: true,
+            must_deliver: false,
         });
         let held = holder.call(request()).await.unwrap();
         assert_eq!(budget.available_permits(), 0);
 
         let mut refused = ReplyMemoryLayer {
             budget: Arc::clone(&budget),
+            metrics: Arc::new(Metrics::default()),
         }
         .layer(FixedReply {
             size: 400,
             never_read: false,
             marked: true,
+            must_deliver: false,
         });
         let reply = refused.call(request()).await.unwrap();
         assert_eq!(
@@ -395,6 +440,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_committed_write_is_answered_when_the_budget_is_spent() {
+        // The budget is spent; a read is refused, and a committed
+        // write's reply goes out anyway, uncounted: the client must
+        // read the truth for a write that landed.
+        let budget = Arc::new(Semaphore::new(400));
+        let mut holder = ReplyMemoryLayer {
+            budget: Arc::clone(&budget),
+            metrics: Arc::new(Metrics::default()),
+        }
+        .layer(FixedReply {
+            size: 400,
+            never_read: true,
+            marked: true,
+            must_deliver: false,
+        });
+        let held = holder.call(request()).await.unwrap();
+        assert_eq!(budget.available_permits(), 0);
+
+        let mut refused = ReplyMemoryLayer {
+            budget: Arc::clone(&budget),
+            metrics: Arc::new(Metrics::default()),
+        }
+        .layer(FixedReply {
+            size: 400,
+            never_read: false,
+            marked: true,
+            must_deliver: false,
+        });
+        let refusal = refused.call(request()).await.unwrap();
+        assert_eq!(
+            refusal
+                .headers()
+                .get(tonic::Status::GRPC_STATUS)
+                .map(|v| v.to_str().unwrap()),
+            Some("8"),
+            "the read is refused"
+        );
+
+        let mut write = ReplyMemoryLayer {
+            budget: Arc::clone(&budget),
+            metrics: Arc::new(Metrics::default()),
+        }
+        .layer(FixedReply {
+            size: 400,
+            never_read: false,
+            marked: true,
+            must_deliver: true,
+        });
+        let reply = write.call(request()).await.unwrap();
+        assert!(
+            reply.headers().get(tonic::Status::GRPC_STATUS).is_none(),
+            "a committed write is never refused"
+        );
+        drop(held);
+        assert_eq!(budget.available_permits(), 400, "the write held nothing");
+    }
+
+    #[tokio::test]
+    async fn a_refusal_is_counted_resource_exhausted_not_cancelled() {
+        let metrics = Arc::new(Metrics::default());
+        // The refusal counts under the call's own RPC, which the path
+        // names, as a real call's does.
+        let request = http::Request::builder()
+            .uri("http://x/scion.v1.Scion/Diff")
+            .body(tonic::body::Body::empty())
+            .unwrap();
+        // One 400-byte reply fits; a second does not, and is refused.
+        let budget = Arc::new(Semaphore::new(600));
+        let mut holder = ReplyMemoryLayer {
+            budget: Arc::clone(&budget),
+            metrics: Arc::clone(&metrics),
+        }
+        .layer(FixedReply {
+            size: 400,
+            never_read: true,
+            marked: true,
+            must_deliver: false,
+        });
+        let _held = holder.call(request).await.unwrap();
+        let request = http::Request::builder()
+            .uri("http://x/scion.v1.Scion/Diff")
+            .body(tonic::body::Body::empty())
+            .unwrap();
+
+        let mut refused = ReplyMemoryLayer {
+            budget: Arc::clone(&budget),
+            metrics: Arc::clone(&metrics),
+        }
+        .layer(FixedReply {
+            size: 400,
+            never_read: false,
+            marked: true,
+            must_deliver: false,
+        });
+        let _refusal = refused.call(request).await.unwrap();
+        let text = metrics.render();
+        assert!(
+            text.contains("code=\"resource_exhausted\"} 1"),
+            "the refusal is a resource_exhausted: {text}"
+        );
+        assert!(
+            !text.contains("code=\"cancelled\"} 1"),
+            "the refusal is not a cancelled: {text}"
+        );
+    }
+
+    #[tokio::test]
     #[should_panic(expected = "neither mark")]
     async fn a_reply_with_neither_mark_is_a_test_failure() {
         // A handler that forgets both marks fails the test that calls
@@ -402,11 +554,13 @@ mod tests {
         let budget = Arc::new(Semaphore::new(1_000));
         let mut service = ReplyMemoryLayer {
             budget: Arc::clone(&budget),
+            metrics: Arc::new(Metrics::default()),
         }
         .layer(FixedReply {
             size: 400,
             never_read: false,
             marked: false,
+            must_deliver: false,
         });
         let _ = service.call(request()).await;
     }
@@ -416,11 +570,13 @@ mod tests {
         let budget = Arc::new(Semaphore::new(1_000));
         let mut service = ReplyMemoryLayer {
             budget: Arc::clone(&budget),
+            metrics: Arc::new(Metrics::default()),
         }
         .layer(FixedReply {
             size: 0, // no exact hint: the size is unknown, as a stream's is
             never_read: true,
             marked: true,
+            must_deliver: false,
         });
         let response = service.call(request()).await.unwrap();
         assert_eq!(
