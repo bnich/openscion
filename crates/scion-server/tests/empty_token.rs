@@ -136,7 +136,12 @@ fn a_server_started_with_a_leading_space_token_answers_its_own_bytes() {
     .find(|p| p.exists())
     .expect("the scn binary is built");
     let out = Command::new(scn)
-        .args(["--server", &format!("http://127.0.0.1:{port}"), "ls", "main"])
+        .args([
+            "--server",
+            &format!("http://127.0.0.1:{port}"),
+            "ls",
+            "main",
+        ])
         .env("SCION_TOKEN", " abc")
         .output()
         .expect("scn runs");
