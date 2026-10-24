@@ -89,11 +89,7 @@ fn tamper_history(store: &Backend, data: &std::path::Path, rows: &[(Vec<u8>, Vec
         .collect();
     // The last row copies the first's body, so at least one row (the
     // first) provably holds another node's bytes even in odd rotations.
-    swapped
-        .last_mut()
-        .unwrap()
-        .1
-        .clone_from(&rows[0].1);
+    swapped.last_mut().unwrap().1.clone_from(&rows[0].1);
     if Backend::test_is_postgres() {
         let schema = Backend::test_schema(data).expect("postgres tests name a schema");
         let url = std::env::var("SCION_TEST_POSTGRES_URL").expect("the test database's URL");
