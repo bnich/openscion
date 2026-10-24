@@ -437,8 +437,13 @@ jobs:
           "$pd" show --all-functions target/coverage/merged.profdata \
             | grep -E '^[^ ].*:$' | sed 's/:$//' | sort -u \
             > target/coverage/all-fn.txt
-          cargo llvm-cov export --format lcov \
-            --instr-profile target/coverage/merged.profdata \
+          lcv="$(find "$(rustc --print sysroot)" -name llvm-cov -type f | head -1)"
+          objects=$(find target/coverage/debug -maxdepth 1 -type f -perm -u+x \
+            ! -name '*.d' ! -name '*.rlib' ! -name '*.so' | tr '\n' ' ')
+          # shellcheck disable=SC2086
+          "$lcv" export $objects \
+            -instr-profile=target/coverage/merged.profdata \
+            --format=lcov \
             ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
             | grep '^FN:' | sed 's/^FN:[0-9]*,//' | sort -u \
             > target/coverage/mapped-fn.txt
