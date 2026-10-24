@@ -388,7 +388,10 @@ jobs:
     # replay's whole-file mutation lever and refuses a run where the
     # mutated restore also passes, so the ceiling is never a guard a
     # whole-history read slips under.
-    if: github.event_name != 'pull_request'
+    # The tier job is pull_request-shaped, so on a dispatch it is
+    # skipped: the ceiling runs anyway, the way lint does.
+    if: >-
+      ${{ github.event_name != 'pull_request' && (needs.tier.result == 'success' || needs.tier.result == 'skipped') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
