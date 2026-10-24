@@ -494,20 +494,7 @@ impl ScionService {
     }
 
     /// Sends `data` in parts, holding `share` for the whole reply.
-    /// Marks a unary reply so the reply-memory layer counts its
-    /// parked bytes: the handler knows the encoded size here, before
-    /// the response returns, which the encoded body never reveals.
-    fn count_reply<M: prost::Message>(response: Response<M>) -> Response<M> {
-        let mut response = response;
-        let size = response.get_ref().encoded_len();
-        response
-            .extensions_mut()
-            .insert(crate::reply::ReplySize(size));
-        response
-    }
-
     fn stream_whole_holding<T: Send + 'static>(
-        _self: &Self,
         call: Call,
         data: Vec<u8>,
         share: OwnedSemaphorePermit,
@@ -787,6 +774,28 @@ impl Worker {
         })?
         .map_err(Status::from)
     }
+}
+
+/// Marks a unary reply so the reply-memory layer counts its
+/// parked bytes: the handler knows the encoded size here, before
+/// the response returns, which the encoded body never reveals.
+pub(crate) fn count_reply<M: prost::Message>(response: Response<M>) -> Response<M> {
+    let mut response = response;
+    let size = response.get_ref().encoded_len();
+    response
+        .extensions_mut()
+        .insert(crate::reply::ReplySize(size));
+    response
+}
+
+/// Marks a streaming reply so the reply-memory layer knows its bytes
+/// are counted elsewhere: the read-budget share it took before the
+/// object was built. The layer's test seam panics on a reply with
+/// neither mark, so a new handler that forgets both fails a test.
+pub(crate) fn mark_stream<T>(response: Response<T>) -> Response<T> {
+    let mut response = response;
+    response.extensions_mut().insert(crate::reply::ReplyStreams);
+    response
 }
 
 pub(crate) use scion_proto::runtime::check::id as parse_id;
@@ -1510,7 +1519,7 @@ impl Scion for ScionService {
             })
             .await;
         let id = written??;
-        Ok(Self::count_reply(Response::new(PutBlobResponse {
+        Ok(count_reply(Response::new(PutBlobResponse {
             blob_id: id.as_bytes().to_vec(),
         })))
     }
@@ -1608,7 +1617,7 @@ impl Scion for ScionService {
             })
             .await;
         let id = outcome??;
-        Ok(Self::count_reply(Response::new(CreateChangesetResponse {
+        Ok(count_reply(Response::new(CreateChangesetResponse {
             changeset_id: id.as_bytes().to_vec(),
         })))
     }
@@ -1737,7 +1746,7 @@ impl Scion for ScionService {
             })
             .await;
         match ran {
-            Ok(Ok(outcome)) => Ok(Response::new(land_response(outcome))),
+            Ok(Ok(outcome)) => Ok(count_reply(Response::new(land_response(outcome)))),
             Ok(Err(status)) => {
                 self.metrics.land(code_label(status.code()));
                 Err(status)
@@ -1763,7 +1772,7 @@ impl Scion for ScionService {
             .worker
             .run(move |store| land::get_land(&store, &caller, &repo, land_id))
             .await?;
-        Ok(Response::new(land_response(outcome)))
+        Ok(count_reply(Response::new(land_response(outcome))))
     }
 
     async fn resolve_ref(
@@ -1772,7 +1781,7 @@ impl Scion for ScionService {
     ) -> Result<Response<ResolveRefResponse>, Status> {
         resolve_ref(&self.worker, &self.access, &self.quotas, request)
             .await
-            .map(Response::new)
+            .map(|r| count_reply(Response::new(r)))
     }
 
     async fn get_changeset(
@@ -1810,14 +1819,13 @@ impl Scion for ScionService {
             .worker
             .run(move |store| Ok(read::get_changeset(&store, &req.repo, id)?.encode()))
             .await?;
-        Ok(Self::stream_whole_holding(
-            &self,
+        Ok(mark_stream(Self::stream_whole_holding(
             call,
             data,
             share,
             stalled,
             |data| GetChangesetResponse { changeset: data },
-        ))
+        )))
     }
 
     type ReadFileStream = ReadFileStream;
@@ -1898,7 +1906,7 @@ impl Scion for ScionService {
             )
             .instrument(tracing::Span::current()),
         );
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(mark_stream(Response::new(ReceiverStream::new(rx))))
     }
 
     async fn list_dir(
@@ -1931,32 +1939,24 @@ impl Scion for ScionService {
             }
             None => None,
         };
-        // The share is taken before the tree is built, sized from the
-        // directory's stored tree body: the body IS the reply's bytes,
-        // so the length is exact. The build below re-reads the same
-        // row, which a changeset-pinned tree cannot change between the
-        // two reads.
-        let view_len = view.clone();
-        let repo_len = req.repo.clone();
-        let metrics_len = Arc::clone(&metrics);
-        let deadline_len = deadline.clone();
-        let path_len = path.clone();
-        let size = self
+        // One worker pass resolves the root and the path (a view root
+        // is not cheap, so it is resolved once), and returns the
+        // directory's id with its stored body's length: the body IS
+        // the reply's bytes, so the length is exact. The share is
+        // taken from that length, before the build reads the row it
+        // already named; a changeset-pinned tree cannot change between
+        // the two reads.
+        let (dir_id, size) = self
             .worker
             .run(move |store| {
-                let view = view_len;
-                let repo = repo_len;
-                let metrics = metrics_len;
-                let deadline = deadline_len;
-                let path = path_len;
                 let root = match &view {
                     Some((digest, prefixes, live)) => {
-                        let repo_id = store.read(|c| c.repo_id(&repo))?;
+                        let repo_id = store.read(|c| c.repo_id(&req.repo))?;
                         views::view_root(
                             &store, repo_id, digest, id, prefixes, live, &metrics, &deadline,
                         )?
                     }
-                    None => read::root_tree(&store, &repo, id, &deadline)?,
+                    None => read::root_tree(&store, &req.repo, id, &deadline)?,
                 };
                 let dir_id = store.read(|c| match path.as_ref() {
                     None => Ok(root),
@@ -1968,34 +1968,22 @@ impl Scion for ScionService {
                         None => Err(crate::Error::NotFound(format!("path {path:?}"))),
                     },
                 })?;
-                Ok(store.read(|c| c.get_tree_body(dir_id))?.len())
+                let size = store.read(|c| c.get_tree_body(dir_id))?.len();
+                Ok((dir_id, size))
             })
             .await?;
         let share = self.whole_share_of(size).await?;
         let data = self
             .worker
-            .run(move |store| {
-                let tree = match &view {
-                    Some((digest, prefixes, live)) => {
-                        let repo_id = store.read(|c| c.repo_id(&req.repo))?;
-                        let root = views::view_root(
-                            &store, repo_id, digest, id, prefixes, live, &metrics, &deadline,
-                        )?;
-                        read::list_dir_at(&store, root, path.as_ref())?
-                    }
-                    None => read::list_dir(&store, &req.repo, id, path.as_ref(), &deadline)?,
-                };
-                Ok(tree.encode())
-            })
+            .run(move |store| Ok(store.read(|c| c.get_tree(dir_id))?.encode()))
             .await?;
-        Ok(Self::stream_whole_holding(
-            &self,
+        Ok(mark_stream(Self::stream_whole_holding(
             call,
             data,
             share,
             stalled,
             |data| ListDirResponse { tree: data },
-        ))
+        )))
     }
 
     async fn log(&self, request: Request<LogRequest>) -> Result<Response<LogStream>, Status> {
@@ -2038,7 +2026,7 @@ impl Scion for ScionService {
         };
         let (tx, rx) = mpsc::channel(2);
         tokio::spawn(log_parts(walk, page, tx).instrument(tracing::Span::current()));
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(mark_stream(Response::new(ReceiverStream::new(rx))))
     }
 
     async fn blame(&self, request: Request<BlameRequest>) -> Result<Response<BlameStream>, Status> {
@@ -2127,7 +2115,7 @@ impl Scion for ScionService {
         };
         let (tx, rx) = mpsc::channel(2);
         tokio::spawn(blame_parts(send, tx).instrument(tracing::Span::current()));
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(mark_stream(Response::new(ReceiverStream::new(rx))))
     }
 
     async fn merge_base(
@@ -2146,7 +2134,7 @@ impl Scion for ScionService {
                 read::merge_base(store, &req.repo, a, b, deadline)
             })
             .await?;
-        Ok(Self::count_reply(Response::new(MergeBaseResponse {
+        Ok(count_reply(Response::new(MergeBaseResponse {
             changeset_ids: bases.iter().map(|id| id.as_bytes().to_vec()).collect(),
         })))
     }
@@ -2167,7 +2155,7 @@ impl Scion for ScionService {
                 read::is_ancestor(store, &req.repo, ancestor, descendant, deadline)
             })
             .await?;
-        Ok(Self::count_reply(Response::new(IsAncestorResponse {
+        Ok(count_reply(Response::new(IsAncestorResponse {
             is_ancestor,
         })))
     }
@@ -2226,7 +2214,7 @@ impl Scion for ScionService {
                 }
             })
             .collect();
-        Ok(Self::count_reply(Response::new(DiffResponse {
+        Ok(count_reply(Response::new(DiffResponse {
             entries,
             next_after: path_bytes(page.next_after),
             renames_incomplete: page.renames_incomplete,

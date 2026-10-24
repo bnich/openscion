@@ -53,6 +53,20 @@ impl ReplyMemoryLayer {
     }
 }
 
+/// The mark of a streaming reply: its bytes are counted by the
+/// read-budget share its handler took before the object was built,
+/// not by this layer.
+#[derive(Clone, Copy)]
+pub(crate) struct ReplyStreams;
+
+/// The refusal a spent budget answers with: a `resource_exhausted`
+/// status carried as a whole http reply, with the content-type a gRPC
+/// client expects (a reply without it is a protocol error to some
+/// clients, whatever tonic accepts).
+fn refusal(message: &'static str) -> http::Response<tonic::body::Body> {
+    tonic::Status::resource_exhausted(message).into_http()
+}
+
 /// The encoded size of a unary reply, set by the handler that built
 /// it, so the budget counts bytes it cannot learn from the body (a
 /// tonic-encoded body carries no exact size hint).
@@ -114,13 +128,21 @@ where
 
     fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
         let budget = Arc::clone(&self.budget);
+        #[cfg_attr(
+            not(any(test, feature = "test-hooks")),
+            expect(
+                unused_variables,
+                reason = "the path names a reply only in the test seam"
+            )
+        )]
+        let path = request.uri().path().to_owned();
         let future = self.inner.call(request);
         // MUTATION levers for the tests' red proofs: "uncounted" never
         // takes the share (a parked reply holds nothing the budget
         // knows of); "held_forever" takes it and never gives it back
         // (a reset cannot free it). Release builds never read these.
         #[cfg(any(test, feature = "test-hooks"))]
-        match std::env::var_os("SCION_REPLY_MUTATION").as_deref() {
+        match std::env::var_os("SCION_TEST_REPLY_MUTATION").as_deref() {
             Some(x) if x == "uncounted" => {
                 return Box::pin(async move {
                     let (parts, body) = future.await?.into_parts();
@@ -141,12 +163,9 @@ where
                             .clone()
                             .try_acquire_many_owned(u32::try_from(size).unwrap_or(u32::MAX))
                     {
-                        let mut refusal = http::Response::new(tonic::body::Body::empty());
-                        refusal.headers_mut().insert(
-                            tonic::Status::GRPC_STATUS,
-                            http::HeaderValue::from_static("8"),
-                        );
-                        return Ok(refusal);
+                        return Ok(refusal(
+                            "the server's reply budget is spent; read what you opened",
+                        ));
                     }
                     let (parts, body) = response.into_parts();
                     Ok(http::Response::from_parts(
@@ -159,6 +178,20 @@ where
         }
         Box::pin(async move {
             let response = future.await?;
+            // A test seam, so a handler that forgets both marks fails a
+            // test instead of passing the budget uncounted: an OK reply
+            // (one that does not refuse in its headers) is either a
+            // unary reply with a size, or a streaming reply with the
+            // stream mark. Release builds never check.
+            #[cfg(any(test, feature = "test-hooks"))]
+            if response.headers().get(tonic::Status::GRPC_STATUS).is_none() {
+                let size = response.extensions().get::<ReplySize>().is_some();
+                let streams = response.extensions().get::<ReplyStreams>().is_some();
+                assert!(
+                    size || streams,
+                    "a reply passed the reply-memory layer with neither mark: {path}"
+                );
+            }
             // The size is what the handler knew when it built the
             // reply (its encoded length, set as a response extension),
             // else the body's exact hint. A streaming reply names
@@ -182,21 +215,9 @@ where
                 // on. The built response is dropped here, so
                 // the refusal frees what it held.
                 tracing::warn!(size, "a unary reply refused: the reply budget is spent");
-                // A trailers-only reply: the status rides in
-                // the headers, so the client reads the refusal
-                // without a body.
-                let mut refusal = http::Response::new(tonic::body::Body::empty());
-                refusal.headers_mut().insert(
-                    tonic::Status::GRPC_STATUS,
-                    http::HeaderValue::from_static("8"),
-                );
-                refusal.headers_mut().insert(
-                    http::HeaderName::from_static("grpc-message"),
-                    http::HeaderValue::from_static(
-                        "the server's reply budget is spent; read what you opened",
-                    ),
-                );
-                return Ok(refusal);
+                return Ok(refusal(
+                    "the server's reply budget is spent; read what you opened",
+                ));
             };
             let (parts, body) = response.into_parts();
             match permit {
@@ -232,6 +253,7 @@ mod tests {
     struct FixedReply {
         size: u64,
         never_read: bool,
+        marked: bool,
     }
 
     impl tower::Service<http::Request<tonic::body::Body>> for FixedReply {
@@ -248,7 +270,17 @@ mod tests {
                 size: self.size,
                 never_read: self.never_read,
             };
-            std::future::ready(Ok(http::Response::new(body)))
+            let mut reply = http::Response::new(body);
+            if self.marked {
+                if self.size == 0 {
+                    reply.extensions_mut().insert(ReplyStreams);
+                } else {
+                    reply
+                        .extensions_mut()
+                        .insert(ReplySize(usize::try_from(self.size).unwrap_or(usize::MAX)));
+                }
+            }
+            std::future::ready(Ok(reply))
         }
     }
 
@@ -294,6 +326,7 @@ mod tests {
         .layer(FixedReply {
             size: 400,
             never_read: false,
+            marked: true,
         });
         let response = service.call(request()).await.unwrap();
         assert_eq!(
@@ -320,6 +353,7 @@ mod tests {
         .layer(FixedReply {
             size: 400,
             never_read: true,
+            marked: true,
         });
         let response = service.call(request()).await.unwrap();
         assert_eq!(budget.available_permits(), 600);
@@ -340,6 +374,7 @@ mod tests {
         .layer(FixedReply {
             size: 1_000,
             never_read: true,
+            marked: true,
         });
         let held = holder.call(request()).await.unwrap();
         assert_eq!(budget.available_permits(), 0);
@@ -350,6 +385,7 @@ mod tests {
         .layer(FixedReply {
             size: 400,
             never_read: false,
+            marked: true,
         });
         let reply = refused.call(request()).await.unwrap();
         assert_eq!(
@@ -365,6 +401,23 @@ mod tests {
     }
 
     #[tokio::test]
+    #[should_panic(expected = "neither mark")]
+    async fn a_reply_with_neither_mark_is_a_test_failure() {
+        // A handler that forgets both marks fails the test that calls
+        // its RPC, instead of passing the budget uncounted.
+        let budget = Arc::new(Semaphore::new(1_000));
+        let mut service = ReplyMemoryLayer {
+            budget: Arc::clone(&budget),
+        }
+        .layer(FixedReply {
+            size: 400,
+            never_read: false,
+            marked: false,
+        });
+        let _ = service.call(request()).await;
+    }
+
+    #[tokio::test]
     async fn a_streaming_reply_takes_no_budget_share() {
         let budget = Arc::new(Semaphore::new(1_000));
         let mut service = ReplyMemoryLayer {
@@ -373,6 +426,7 @@ mod tests {
         .layer(FixedReply {
             size: 0, // no exact hint: the size is unknown, as a stream's is
             never_read: true,
+            marked: true,
         });
         let response = service.call(request()).await.unwrap();
         assert_eq!(
