@@ -412,9 +412,22 @@ struct Inner<S> {
     /// empty wakes once per settle instead of polling.
     settled: tokio::sync::Notify,
     /// The keys that a ticket of a call must verify against: the keys of
-    /// the upstream server, one of which is enough. Empty on a daemon,
-    /// which does not check tickets, only forwards them.
-    ticket_keys: Vec<ed25519_dalek::VerifyingKey>,
+    /// The tickets this tier checks, and how.
+    tickets: Tickets,
+}
+
+/// How a tier treats the ticket of a call. The mode is the constructor's
+/// explicit choice and lives here, so no `is_empty()` ever decides a
+/// security path.
+enum Tickets {
+    /// A cache: every call's ticket must verify against one of these
+    /// keys, and the walk from its root tree proves every object. The
+    /// list is never empty: `Tier::new` refuses it.
+    Verify(Vec<ed25519_dalek::VerifyingKey>),
+    /// A daemon: the ticket is relayed as it came, unverified, and the
+    /// upstream does the checking. The walk is skipped with it (a relay
+    /// has no root tree of its own to walk from).
+    Relay,
 }
 
 /// What one reply has done: hits and misses for the log, and how far into
@@ -497,7 +510,7 @@ impl<S: Store> Tier<S> {
             upstream_token,
             timeout,
             client_tls,
-            ticket_keys,
+            Tickets::Verify(ticket_keys),
         )
     }
 
@@ -523,7 +536,7 @@ impl<S: Store> Tier<S> {
             upstream_token,
             timeout,
             client_tls,
-            Vec::new(),
+            Tickets::Relay,
         )
     }
 
@@ -533,7 +546,7 @@ impl<S: Store> Tier<S> {
         upstream_token: &str,
         timeout: Duration,
         client_tls: Option<&ClientTls>,
-        ticket_keys: Vec<ed25519_dalek::VerifyingKey>,
+        tickets: Tickets,
     ) -> anyhow::Result<Self> {
         let endpoint = Endpoint::from_shared(upstream.to_owned())
             .with_context(|| format!("bad upstream address {upstream:?}"))?;
@@ -586,7 +599,7 @@ impl<S: Store> Tier<S> {
                 fetching: Arc::new(Semaphore::new(FETCH_BYTES)),
                 flights: Mutex::default(),
                 settled: tokio::sync::Notify::new(),
-                ticket_keys,
+                tickets,
             }),
         })
     }
@@ -769,7 +782,7 @@ impl<S: Store> Tier<S> {
         // anyway, so serving unproved objects adds nothing. Trigger to
         // upgrade: a daemon that serves several OS users must walk (and
         // then check tickets), like a cache.
-        if !self.inner.ticket_keys.is_empty()
+        if matches!(self.inner.tickets, Tickets::Verify(_))
             && let Err(failed) = self.prove(i, ask).await
         {
             return Some((Err(failed), self.share(held, 1, ask).await?));
@@ -1424,10 +1437,13 @@ impl<S: Store> Objects for Tier<S> {
         // a daemon with no ticket keys serves what its store holds, to the
         // one OS user that owns its private socket (see the SHORTCUT at
         // `produce`).
-        let ticket = if self.inner.ticket_keys.is_empty() {
-            scion_proto::ticket::parse_unverified(&ticket, scion_proto::ticket::now())
-        } else {
-            scion_proto::ticket::parse(&ticket, &self.inner.ticket_keys, scion_proto::ticket::now())
+        let ticket = match &self.inner.tickets {
+            Tickets::Relay => {
+                scion_proto::ticket::parse_unverified(&ticket, scion_proto::ticket::now())
+            }
+            Tickets::Verify(keys) => {
+                scion_proto::ticket::parse(&ticket, keys, scion_proto::ticket::now())
+            }
         }
         .map_err(|why| {
             // The reason only: no ticket bytes, and no signature.
