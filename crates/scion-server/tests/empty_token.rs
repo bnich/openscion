@@ -14,6 +14,11 @@ fn empty_digest() -> String {
     blake3::Hash::from(token_digest("")).to_hex().to_string()
 }
 
+/// The digest of `token`, as an access file line wants it.
+fn expected_digest(token: &str) -> String {
+    blake3::Hash::from(token_digest(token)).to_hex().to_string()
+}
+
 #[test]
 fn an_access_file_naming_the_empty_digest_is_refused() {
     let text = format!("token\tci\t{}\nread\tci\tmain\n", empty_digest());
@@ -70,6 +75,43 @@ fn hash_token_refuses_a_whitespace_only_argv_token() {
         err.contains("whitespace") || err.contains("no secret"),
         "the refusal names the problem: {err}"
     );
+}
+
+/// A token with a leading space is a real token: the server keeps its
+/// bytes, and a client that sends the same bytes authenticates.
+#[test]
+fn a_token_with_a_leading_space_still_authenticates_its_own_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("data")).unwrap();
+    let access = write_access(dir.path(), &expected_digest(" leading space"));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_scion-server"))
+        .args([
+            "--data",
+            dir.path().join("data").to_str().unwrap(),
+            "serve",
+            "--access",
+            access.to_str().unwrap(),
+        ])
+        .env_remove("SCION_TOKEN")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the server starts");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let alive = child.try_wait().expect("the wait works").is_none();
+    if !alive {
+        let mut err = String::new();
+        use std::io::Read as _;
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut err)
+            .unwrap();
+        panic!("the server refused a whitespace-led token: {err}");
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
 }
 
 /// A server whose access file names the empty digest does not start.

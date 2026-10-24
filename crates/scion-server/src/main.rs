@@ -1113,8 +1113,7 @@ fn serve_flags(args: &ServeArgs) -> anyhow::Result<ServeFlags> {
         (None, Some(file)) => Some(secret_file(file)?),
         (None, None) => std::env::var("SCION_TOKEN")
             .ok()
-            .map(|t| t.trim().to_owned())
-            .filter(|t| !t.is_empty()),
+            .filter(|t| !t.trim().is_empty()),
     };
     let (access, single) = load_access(token, None, args.access.clone())?;
     let caps = caps(
@@ -1316,12 +1315,11 @@ fn load_access(
         return Ok((scion_server::Access::single(&token), true));
     }
     if let Some(token) = token {
-        let trimmed = token.trim();
         anyhow::ensure!(
-            !trimmed.is_empty(),
+            !token.trim().is_empty(),
             "--token must not be empty or whitespace-only"
         );
-        return Ok((scion_server::Access::single(trimmed), true));
+        return Ok((scion_server::Access::single(&token), true));
     }
     let file = access.expect("exactly one source is given");
     // The access file holds bearer tokens: read through one checked
@@ -1452,15 +1450,14 @@ fn hash_token() -> anyhow::Result<()> {
         (Some(_), None) => {
             warn_argv_secret("--token", "--token-file, SCION_TOKEN or stdin");
             let token = token.expect("the argv form is given");
-            let trimmed = token.trim();
             anyhow::ensure!(
-                !trimmed.is_empty(),
+                !token.trim().is_empty(),
                 "a token of only whitespace is no secret"
             );
-            trimmed.to_owned()
+            token
         }
         (None, None) => match std::env::var("SCION_TOKEN") {
-            Ok(env_token) if !env_token.trim().is_empty() => env_token.trim().to_owned(),
+            Ok(env_token) if !env_token.trim().is_empty() => env_token,
             _ => {
                 use std::io::Read as _;
                 let mut from_stdin = String::new();
