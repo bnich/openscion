@@ -1897,16 +1897,43 @@ pub(crate) fn reset_schema(url: &str, ca: Option<&Path>) -> Result<()> {
     // setup asks the database `current_schema()` and locks that. A
     // refusal here is another server's hold, and the drop must not run.
     let client = connect_exclusive(url, ca, &options, None, Arc::new(Fence::new()))?;
+    // The target schema, resolved ONCE and quoted: the guards, the lock
+    // and the drop must all act on the same name. A URL whose
+    // search_path names another schema resolves current_schema() to
+    // that schema, and the guards would read the public schema empty
+    // while the drop tore the search_path's schema down - the hole the
+    // verifiers found. A search_path whose members all miss answers
+    // NULL: the connection would create nothing, so refuse with the
+    // fix.
+    let schema: Option<String> = client
+        .query_opt("SELECT current_schema()::text", &[])?
+        .and_then(|row| row.get::<_, Option<String>>(0));
+    let Some(schema) = schema else {
+        return Err(Error::InvalidArgument(
+            "the URL's search_path names no existing schema; create it first".into(),
+        ));
+    };
+    // The identifier, quoted the way to_regclass and the DDL want it:
+    // a schema name with a quote or a space is still one name.
+    let quoted = schema.replace('"', "\"\"");
     // The drop's only other guard is what the schema holds: this is the
     // one check a stopped store's URL cannot escape - a stopped server
     // holds no lock, so the schema's own rows decide. A schema that
     // carries a store's identity and no restore's staging mark is a
-    // real store: refused, unchanged, whatever the lock says.
+    // real store: refused, unchanged, whatever the lock says. The
+    // lookup is qualified with the resolved schema, never a hard-wired
+    // `public`: the guards and the drop act on the same name.
     let staging: Option<String> = client
-        .query_opt("SELECT to_regclass('public.restore_staging')::text", &[])?
+        .query_opt(
+            &format!("SELECT to_regclass('{quoted}.restore_staging')::text"),
+            &[],
+        )?
         .and_then(|row| row.get::<_, Option<String>>(0));
     let named: Option<String> = client
-        .query_opt("SELECT to_regclass('public.store_uuid')::text", &[])?
+        .query_opt(
+            &format!("SELECT to_regclass('{quoted}.store_uuid')::text"),
+            &[],
+        )?
         .and_then(|row| row.get::<_, Option<String>>(0));
     if staging.is_none() && named.is_some() {
         return Err(Error::Corrupt(
@@ -1918,9 +1945,12 @@ pub(crate) fn reset_schema(url: &str, ca: Option<&Path>) -> Result<()> {
     if staging.is_none() && named.is_none() {
         // Not ours and not a store: a schema with other objects is not
         // a restore's leftover, and nothing here may drop it.
+        let escaped = schema.replace('\'', "''");
         let foreign: i64 = client.query(
-            "SELECT count(*) FROM pg_catalog.pg_class \
-                 WHERE relnamespace = 'public'::regnamespace AND relkind = 'r'",
+            &format!(
+                "SELECT count(*) FROM pg_catalog.pg_class \
+                 WHERE relnamespace = '{escaped}'::regnamespace AND relkind = 'r'"
+            ),
             &[],
         )?[0]
             .get(0);
@@ -1938,15 +1968,10 @@ pub(crate) fn reset_schema(url: &str, ca: Option<&Path>) -> Result<()> {
     client.batch(&format!(
         "SET lock_timeout = '{RESET_LOCK_TIMEOUT}'; SET statement_timeout = '{RESET_STATEMENT_TIMEOUT}'"
     ))?;
-    let schema: String = client.query("SELECT current_schema()", &[])?[0]
-        .try_get(0)
-        .map_err(|error| {
-            Error::Corrupt(format!("the database answers no current schema: {error}"))
-        })?;
     // One batch: a crash between the drop and the create would leave
     // the next open a database with no schema to land in.
     if let Err(why) = client.batch(&format!(
-        "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}"
+        "DROP SCHEMA IF EXISTS \"{quoted}\" CASCADE; CREATE SCHEMA \"{quoted}\""
     )) {
         return Err(Error::Corrupt(format!(
             "the staging schema {schema} is left behind: {why}; the next restore's start resets it"
@@ -1955,7 +1980,9 @@ pub(crate) fn reset_schema(url: &str, ca: Option<&Path>) -> Result<()> {
     // This schema is now the restore's staging, and its mark is what
     // the next restore's start looks for: a schema with the mark is a
     // restore's leftover, whatever a kill did to the process that made
-    // it. A store's identity never has it.
+    // it. A store's identity never has it. The mark's table is created
+    // in the resolved schema (the connection's search_path already
+    // lands there).
     let mut id = [0_u8; 16];
     getrandom::fill(&mut id).expect("system randomness");
     let id: String = id
@@ -2156,6 +2183,9 @@ fn pg_error_of(code: Option<&str>, e: postgres::Error) -> Error {
         // foreign key) is one answer among many: it logs quietly.
         Some(code) if code.starts_with("23") => {
             tracing::debug!("the database refused a statement: {e}");
+            if let Some(db) = e.as_db_error() {
+                tracing::debug!("PROBE code {} message {}", code, db.message());
+            }
             Error::Storage(Storage::internal(e))
         }
         // Out of space: the same shortage, wherever the metadata lives.

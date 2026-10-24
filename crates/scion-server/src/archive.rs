@@ -681,6 +681,7 @@ fn restore_into_with(
     // publication - the rename of the staging directory into the target
     // - is the restore's all-or-nothing point, and it happens after the
     // last transaction.
+    let last_repo = small_sections.last().map(|(name, ..)| name.as_str());
     for (name, members, refs, lands, provenance) in &small_sections {
         let (repo_id, repo_txs) = replay_changesets(&store, archive, name, members, tx_bytes)?;
         txs += repo_txs;
@@ -708,13 +709,24 @@ fn restore_into_with(
             c.put_git_imports(repo_id, provenance)?;
             // Publication is atomic with this transaction on Postgres:
             // the store that answers reads must never carry the staging
-            // mark the next restore would drop it by. A kill after this
-            // transaction leaves a complete store with no mark - refused
-            // as a real store, which it now is.
-            c.clear_restore_mark()?;
+            // mark the next restore would drop it by - and only once,
+            // in the LAST repo's transaction: a mark cleared by an
+            // earlier repo's publication would leave a kill between
+            // repos with partial data and no mark, which the next
+            // restore would misread as a complete store.
+            if Some(name.as_str()) == last_repo {
+                c.clear_restore_mark()?;
+            }
             Ok(())
         })?;
         txs += 1;
+        // The kill seam of the between-repos test: the process dies
+        // after this repo's publication, with no failure path, the way
+        // a kill lands. The mark is (or is not) whatever the code left.
+        #[cfg(any(test, feature = "test-hooks"))]
+        if std::env::var("SCION_TEST_RESTORE_EXIT_AFTER").as_deref() == Ok(name.as_str()) {
+            std::process::exit(9);
+        }
     }
     note_restore_txs(txs);
     Ok(RestoreReport {

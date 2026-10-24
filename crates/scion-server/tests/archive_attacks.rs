@@ -8,6 +8,7 @@
 //! that fails names a bug.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
@@ -711,6 +712,92 @@ fn a_restore_at_a_stopped_stores_url_refuses_and_leaves_it_whole() {
         .unwrap();
 }
 
+/// F1: the guards read the schema the URL lands in, the same one the
+/// lock and the drop act on. A stopped store whose schema is not
+/// `public`, reached by a URL whose `search_path` names it, must
+/// refuse with every row intact: the guards read its rows, not
+/// `public`'s. Red
+/// on today's code: the guards read `public` (empty), so the restore
+/// dropped the stopped store's real schema. Runs only where
+/// `SCION_TEST_POSTGRES_URL` names the job's own scratch instance.
+#[test]
+fn a_stopped_store_in_a_search_path_schema_is_refused_whole() {
+    let Ok(base) = std::env::var("SCION_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let name = format!("scion_restore_attack_schema_{}", std::process::id());
+    let mut maker = postgres::Client::connect(&base, postgres::NoTls).unwrap();
+    maker
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {name}"))
+        .unwrap();
+    maker
+        .batch_execute(&format!("CREATE DATABASE {name}"))
+        .unwrap();
+    let root = base
+        .rsplit_once('/')
+        .map_or(base.as_str(), |(rest, _)| rest);
+    let plain = format!("{root}/{name}");
+    // The store's schema is not `public`: a URL whose search_path
+    // names `privateschema` reaches it, and current_schema() follows.
+    // The schema rides the scratch database, not the shared one.
+    postgres::Client::connect(&plain, postgres::NoTls)
+        .unwrap()
+        .batch_execute("CREATE SCHEMA privateschema")
+        .unwrap();
+    // The search_path keeps `public` after the schema: the catalog
+    // lookups ride it, as an operator's URL would.
+    let url = format!("{root}/{name}?options=--search_path%3Dprivateschema%2Cpublic");
+    let (_keep, out, _main, _second) = sound_archive();
+    let target = tempfile::tempdir().unwrap().path().join("restored-schema");
+    std::fs::create_dir_all(&target).unwrap();
+    // Restore A publishes into the private schema: a complete store.
+    archive::restore(&out, &target, Some(&url), None)
+        .unwrap_or_else(|e| panic!("restore A failed: {e:#}"));
+    let mut check = postgres::Client::connect(&plain, postgres::NoTls).unwrap();
+    let repos_before: i64 = check
+        .query_one("SELECT count(*) FROM privateschema.repos", &[])
+        .unwrap()
+        .get(0);
+    assert!(
+        repos_before >= 1,
+        "restore A landed its repos in the private schema"
+    );
+    drop(check);
+    // Restore B at the same URL: the stopped store's own schema is
+    // reached by the search_path, so its rows decide - REFUSED, whole.
+    let target_b = tempfile::tempdir()
+        .unwrap()
+        .path()
+        .join("restored-schema-b");
+    std::fs::create_dir_all(&target_b).unwrap();
+    let restored = archive::restore(&out, &target_b, Some(&url), None);
+    assert!(
+        restored.is_err(),
+        "a restore at a stopped store's search_path URL must refuse"
+    );
+    let mut check = postgres::Client::connect(&plain, postgres::NoTls).unwrap();
+    let repos_after: i64 = check
+        .query_one("SELECT count(*) FROM privateschema.repos", &[])
+        .unwrap()
+        .get(0);
+    let schema_left: i64 = check
+        .query_one(
+            "SELECT count(*) FROM pg_catalog.pg_namespace WHERE nspname = 'privateschema'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    drop(check);
+    assert_eq!(
+        repos_after, repos_before,
+        "the refused restore must leave the store's rows unchanged"
+    );
+    assert_eq!(schema_left, 1, "the store's schema is intact");
+    maker
+        .batch_execute(&format!("DROP DATABASE {name}"))
+        .unwrap();
+}
+
 /// The published store must not carry the mark (Y1): restore A lands,
 /// a server serves it and lands one more change, the server stops, and
 /// restore B at the same URL must refuse - not drop a real store as a
@@ -872,4 +959,99 @@ fn an_archive_of_an_unknown_version_or_format_is_refused() {
         error.to_string().contains("not a scion archive"),
         "the refusal must name the format rule: {error}"
     );
+}
+
+/// F2: the mark clears once, in the LAST repo's publication
+/// transaction. A kill between repos - here after the first repo's
+/// publication, with no failure path - leaves partial data, and the
+/// next restore must reset it cleanly: the mark is still on, so the
+/// schema reads as this restore's staging and the reset drops it. Red
+/// on the old code: each repo's publication cleared the mark, so the
+/// kill left a schema with a store's identity and no mark, and the
+/// next restore refused it as a complete store. Runs only where
+/// `SCION_TEST_POSTGRES_URL` names the job's own scratch instance.
+#[test]
+fn a_kill_between_repos_resets_cleanly_on_the_next_restore() {
+    let Ok(base) = std::env::var("SCION_TEST_POSTGRES_URL") else {
+        return;
+    };
+    // The child half: the restore that dies after the first repo's
+    // publication. The parent re-runs this binary with the seam armed.
+    if std::env::var("SCION_TEST_RESTORE_EXIT_AFTER").is_ok() {
+        let url = std::env::var("SCION_TEST_RESTORE_URL").unwrap();
+        let archive = std::env::var("SCION_TEST_RESTORE_ARCHIVE").unwrap();
+        let data = std::env::var("SCION_TEST_RESTORE_DATA").unwrap();
+        let _ = archive::restore(
+            std::path::Path::new(&archive),
+            std::path::Path::new(&data),
+            Some(&url),
+            None,
+        );
+        return;
+    }
+    let name = format!("scion_restore_attack_kill_{}", std::process::id());
+    let mut maker = postgres::Client::connect(&base, postgres::NoTls).unwrap();
+    maker
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {name}"))
+        .unwrap();
+    maker
+        .batch_execute(&format!("CREATE DATABASE {name}"))
+        .unwrap();
+    let root = base
+        .rsplit_once('/')
+        .map_or(base.as_str(), |(rest, _)| rest);
+    let url = format!("{root}/{name}");
+    let (_keep, out, _main, _second) = sound_archive();
+    let parent = std::env::current_exe().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let target = data.path().join("restored");
+    std::fs::create_dir_all(&target).unwrap();
+    // The child: the same test binary, the restore armed to exit after
+    // the first repo's publication.
+    let status = Command::new(parent)
+        .args([
+            "--exact",
+            "a_kill_between_repos_resets_cleanly_on_the_next_restore",
+            "--nocapture",
+        ])
+        .env("SCION_TEST_RESTORE_EXIT_AFTER", REPO)
+        .env("SCION_TEST_RESTORE_URL", &url)
+        .env("SCION_TEST_RESTORE_ARCHIVE", &out)
+        .env("SCION_TEST_RESTORE_DATA", &target)
+        .env("SCION_TEST_POSTGRES_URL", &base)
+        .env("RUST_LOG", "error")
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(9), "the child must die at the seam");
+    // The killed restore left partial data: the first repo's rows sit
+    // in the schema, the second's do not, and the mark is (or is not)
+    // whatever the code under test left there.
+    let mut check = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let first: i64 = check
+        .query_one("SELECT count(*) FROM repos WHERE name = $1", &[&REPO])
+        .unwrap()
+        .get(0);
+    let second: i64 = check
+        .query_one("SELECT count(*) FROM repos WHERE name = $1", &[&SECOND])
+        .unwrap()
+        .get(0);
+    drop(check);
+    assert_eq!(first, 1, "the kill landed after the first repo");
+    assert_eq!(second, 0, "the kill landed before the second repo");
+    // The next restore at the same URL resets the leftover cleanly and
+    // lands the whole archive.
+    let target_b = data.path().join("restored-again");
+    std::fs::create_dir_all(&target_b).unwrap();
+    archive::restore(&out, &target_b, Some(&url), None)
+        .unwrap_or_else(|e| panic!("the next restore must reset the leftover: {e:#}"));
+    let mut check = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let repos: i64 = check
+        .query_one("SELECT count(*) FROM repos", &[])
+        .unwrap()
+        .get(0);
+    drop(check);
+    assert_eq!(repos, 2, "the clean restore landed both repos");
+    maker
+        .batch_execute(&format!("DROP DATABASE {name}"))
+        .unwrap();
 }
