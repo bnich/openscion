@@ -760,7 +760,10 @@ re-date such a commit in the git history and import again.
 
 So an upgrade is: stop the server (and any tiers that share the directory —
 none do by default), copy the directory as a backup (section 3), start the
-new binary, watch the log for the migration, run `fsck`. Schema 7 (tree
+new binary, watch the log for the migration, run `fsck`. A store that has
+data logs its migration steps when a build migrates it; a first boot on a
+fresh, empty directory logs no migration - it says the store was created.
+Schema 7 (tree
 entry sizes, `#172`) drops every stored tree and its derived rows, so the
 first queries after it re-derive trees from the stored changesets; the
 blobs and changesets stay. A tier's store may keep tree bytes of the old
