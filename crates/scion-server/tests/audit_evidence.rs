@@ -152,26 +152,11 @@ fn fsck_reports_a_tampered_history_node() {
     let store = Backend::open_test(dir.path()).unwrap();
     let _ids = two_changesets(&store);
 
-    let before = history_rows(&store);
-    tamper_history(&store, dir.path(), &before);
-    let after = history_rows(&store);
-    eprintln!(
-        "fsck probe: rows {} bodies-changed {}",
-        after.len(),
-        after
-            .iter()
-            .zip(&before)
-            .filter(|((_, a), (_, b))| a != b)
-            .count()
-    );
+    tamper_history(&store, dir.path(), &history_rows(&store));
 
     let problems = scion_server::fsck::run(&store, scion_server::fsck::BATCH, &mut |_| {})
         .unwrap()
         .problems;
-    eprintln!("fsck probe: {} problems", problems.len());
-    for p in &problems {
-        eprintln!("  problem: {p}");
-    }
     assert!(
         problems
             .iter()
