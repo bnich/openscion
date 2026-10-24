@@ -3,6 +3,7 @@
 //! parse, `hash-token` refuses empty and whitespace-only input, and a
 //! server whose access file names the empty digest does not start.
 
+use std::io::Read as _;
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 
@@ -104,7 +105,6 @@ fn a_token_with_a_leading_space_still_authenticates_its_own_bytes() {
     let alive = child.try_wait().expect("the wait works").is_none();
     if !alive {
         let mut err = String::new();
-        use std::io::Read as _;
         child
             .stderr
             .take()
