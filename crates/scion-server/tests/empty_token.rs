@@ -40,6 +40,17 @@ fn hash_token(args: &[&str]) -> (bool, String, String) {
     )
 }
 
+fn write_access(dir: &std::path::Path, digest: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let access = dir.join("access");
+    let mut file = std::fs::File::create(&access).unwrap();
+    writeln!(file, "token\tci\t{digest}").unwrap();
+    writeln!(file, "read\tci\tmain").unwrap();
+    drop(file);
+    std::fs::set_permissions(&access, std::fs::Permissions::from_mode(0o600)).unwrap();
+    access
+}
+
 #[test]
 fn hash_token_refuses_an_empty_argv_token() {
     let (ok, out, err) = hash_token(&["--token", ""]);
@@ -65,13 +76,7 @@ fn hash_token_refuses_a_whitespace_only_argv_token() {
 #[test]
 fn a_server_whose_access_file_names_the_empty_digest_does_not_start() {
     let dir = tempfile::tempdir().unwrap();
-    let access = dir.path().join("access");
-    let mut file = std::fs::File::create(&access).unwrap();
-    use std::os::unix::fs::PermissionsExt as _;
-    writeln!(file, "token\tci\t{}", empty_digest()).unwrap();
-    writeln!(file, "read\tci\tmain").unwrap();
-    drop(file);
-    std::fs::set_permissions(&access, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let access = write_access(dir.path(), &empty_digest());
 
     let out = Command::new(env!("CARGO_BIN_EXE_scion-server"))
         .args([
