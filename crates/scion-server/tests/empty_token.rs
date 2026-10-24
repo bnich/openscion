@@ -78,29 +78,33 @@ fn hash_token_refuses_a_whitespace_only_argv_token() {
     );
 }
 
-/// A token with a leading space is a real token: the server keeps its
-/// bytes, and a client that sends the same bytes authenticates.
+/// The token bytes a leading-space token keeps: the server started with
+/// SCION_TOKEN=' abc' answers a client that sends bearer ' abc'.
 #[test]
-fn a_token_with_a_leading_space_still_authenticates_its_own_bytes() {
+fn a_server_started_with_a_leading_space_token_answers_its_own_bytes() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir(dir.path().join("data")).unwrap();
-    let access = write_access(dir.path(), &expected_digest(" leading space"));
-    let serve = |dir: &std::path::Path, access: &std::path::Path| {
-        Command::new(env!("CARGO_BIN_EXE_scion-server"))
-            .args([
-                "--data",
-                dir.to_str().unwrap(),
-                "serve",
-                "--access",
-                access.to_str().unwrap(),
-            ])
-            .env_remove("SCION_TOKEN")
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("the server starts")
-    };
-    let mut child = serve(&dir.path().join("data"), &access);
+    let data = dir.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    // A port the OS says is free: grab one and give it to the server,
+    // so a stale listener from an earlier run cannot block the start.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_scion-server"))
+        .args([
+            "--data",
+            data.to_str().unwrap(),
+            "serve",
+            "--listen",
+            &format!("127.0.0.1:{port}"),
+        ])
+        .env("SCION_TOKEN", " abc")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the server starts");
     std::thread::sleep(std::time::Duration::from_secs(2));
     let alive = child.try_wait().expect("the wait works").is_none();
     if !alive {
@@ -111,10 +115,52 @@ fn a_token_with_a_leading_space_still_authenticates_its_own_bytes() {
             .unwrap()
             .read_to_string(&mut err)
             .unwrap();
-        panic!("the server refused a whitespace-led token: {err}");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        panic!("the server refused a leading-space token at start: {err}");
     }
+    // A real authed call from a client that sends the same bytes. The
+    // scn binary sits in the same target tree as this test's own binary,
+    // under the profile dir the build made.
+    let target = std::env::current_exe()
+        .unwrap()
+        .ancestors()
+        .nth(3)
+        .unwrap()
+        .to_path_buf();
+    let scn = [
+        target.join("debug").join("scn"),
+        target.join("release").join("scn"),
+    ]
+    .into_iter()
+    .find(|p| p.exists())
+    .expect("the scn binary is built");
+    let out = Command::new(scn)
+        .args(["--server", &format!("http://127.0.0.1:{port}"), "ls", "main"])
+        .env("SCION_TOKEN", " abc")
+        .output()
+        .expect("scn runs");
     child.kill().unwrap();
     child.wait().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("valid authentication credentials"),
+        "the server did not answer the client's own bytes: {err}"
+    );
+}
+
+/// hash-token keeps the bytes it refused to trim: ' abc' hashes as
+/// blake3(' abc'), not blake3('abc').
+#[test]
+fn hash_token_keeps_a_leading_space() {
+    let (ok, out, err) = hash_token(&["--token", " abc"]);
+    assert!(ok, "hash-token refused a leading-space token: {err}");
+    assert_eq!(
+        out.trim(),
+        expected_digest(" abc"),
+        "the digest must be of the bytes the client will send"
+    );
+    assert_ne!(out.trim(), expected_digest("abc"));
 }
 
 /// A server whose access file names the empty digest does not start.
