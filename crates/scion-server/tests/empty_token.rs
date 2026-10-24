@@ -79,7 +79,7 @@ fn hash_token_refuses_a_whitespace_only_argv_token() {
 }
 
 /// The token bytes a leading-space token keeps: the server started with
-/// SCION_TOKEN=' abc' answers a client that sends bearer ' abc'.
+/// `SCION_TOKEN`=' abc' answers a client that sends bearer ' abc'.
 #[test]
 fn a_server_started_with_a_leading_space_token_answers_its_own_bytes() {
     let dir = tempfile::tempdir().unwrap();
