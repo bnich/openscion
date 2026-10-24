@@ -1230,3 +1230,116 @@ fn a_zero_repo_archive_leaves_no_staging_mark() {
             .unwrap();
     }
 }
+
+/// V2: the failure path quotes the schema name too. A replay that dies
+/// halfway leaves its partial schema behind, and the restore resets it
+/// with DROP/CREATE - the last place the schema's name rode raw into
+/// SQL text. A schema whose name holds a double quote and a space,
+/// reached by a `search_path` URL, is dropped and recreated as itself;
+/// a second schema named like the quote's continuation stays. Red on
+/// fcd48a32: the raw interpolation is a syntax error, the reset warns
+/// and gives up, and the failed replay's schema stays behind with its
+/// rows. Runs only where `SCION_TEST_POSTGRES_URL` names the job's own
+/// scratch instance.
+#[test]
+fn a_failed_restore_resets_a_quoted_schema_as_itself() {
+    let Ok(base) = std::env::var("SCION_TEST_POSTGRES_URL") else {
+        return;
+    };
+    // The store's schema holds a double quote and a space; `b c` is
+    // the name the raw interpolation's quote-continuation would reach.
+    let name = format!("scion_restore_attack_quotey_{}", std::process::id());
+    let mut maker = postgres::Client::connect(&base, postgres::NoTls).unwrap();
+    maker
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {name}"))
+        .unwrap();
+    maker
+        .batch_execute(&format!("CREATE DATABASE {name}"))
+        .unwrap();
+    let plain = format!(
+        "{}/{}",
+        base.rsplit_once('/')
+            .map_or(base.as_str(), |(rest, _)| rest),
+        name
+    );
+    postgres::Client::connect(&plain, postgres::NoTls)
+        .unwrap()
+        .batch_execute("CREATE SCHEMA \"a\"\"b c\"; CREATE SCHEMA \"b c\"")
+        .unwrap();
+    // The search_path names the quoted schema: the quote doubled, the
+    // space escaped, public after it.
+    let url = format!("{plain}?options=--search_path%3D%22a%22%22b%5C%20c%22%2Cpublic");
+    let (_keep, out, _main, _second) = sound_archive();
+    // The lock the replay dies on: down as soon as the open's tables
+    // appear in the quoted schema, held past the writer's clock.
+    let holder_url = plain.clone();
+    let (locked, wait_locked) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let mut db = postgres::Client::connect(&holder_url, postgres::NoTls).unwrap();
+        let started = std::time::Instant::now();
+        loop {
+            let there: Option<String> = db
+                .query_one("SELECT to_regclass('\"a\"\"b c\".changesets')::text", &[])
+                .unwrap()
+                .get(0);
+            if there.is_some() {
+                db.batch_execute("BEGIN; LOCK TABLE \"a\"\"b c\".changesets IN EXCLUSIVE MODE;")
+                    .unwrap();
+                let _ = locked.send(());
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                let _ = db.batch_execute("COMMIT");
+                return;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(30),
+                "the test database never gained its changesets table within 30 s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    });
+    let empty = tempfile::tempdir().unwrap();
+    let restored = archive::restore_with(&out, empty.path(), Some(&url), None, |path, url, ca| {
+        let store = scion_server::Backend::open(path, url, ca)?;
+        wait_locked
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the holder never took its table");
+        Ok(store)
+    });
+    assert!(
+        restored.is_err(),
+        "a replay that waited out the lock clock must not report success"
+    );
+    holder.join().unwrap();
+    // The failure path reset the quoted schema: dropped with every row
+    // the replay committed, recreated empty. Red on the raw
+    // interpolation: the DROP is a syntax error, the schema keeps its
+    // tables.
+    let mut check = postgres::Client::connect(&plain, postgres::NoTls).unwrap();
+    let left: i64 = check
+        .query_one(
+            "SELECT count(*) FROM pg_catalog.pg_class \
+             WHERE relnamespace = '\"a\"\"b c\"'::regnamespace AND relkind = 'r'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    let twin: i64 = check
+        .query_one(
+            "SELECT count(*) FROM pg_catalog.pg_namespace WHERE nspname = 'b c'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    drop(check);
+    assert_eq!(
+        left, 0,
+        "the failed restore must reset the quoted schema; {left} table(s) stayed"
+    );
+    assert_eq!(
+        twin, 1,
+        "the schema the quote's continuation names must stay"
+    );
+    maker
+        .batch_execute(&format!("DROP DATABASE {name}"))
+        .unwrap();
+}

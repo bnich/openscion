@@ -718,6 +718,12 @@ restore at that URL refuses it and names the way out - rename the
 target's `<name>.restoring` directory into place and start a server on
 it, or restore into a new schema.
 
+One warning about that name: a restore's **start** deletes a
+`<name>.restoring` directory beside the target without asking - it is
+the scratch of a run that died mid-replay, never a store. Keep nothing
+under that name, and rename a leftover into place (the way out above)
+before you start the next restore.
+
 Proof: crates/scion-server/tests/archive_attacks.rs::a_restore_at_a_stopped_stores_url_refuses_and_leaves_it_whole
 Proof: crates/scion-server/tests/archive_attacks.rs::a_restored_store_does_not_carry_the_mark_and_a_later_restore_refuses
 

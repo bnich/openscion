@@ -444,7 +444,7 @@ impl ReplayFrames {
 fn mutation_whole_file() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("SCION_RESTORE_MUTATION").as_deref()
+        std::env::var_os("SCION_TEST_RESTORE_MUTATION").as_deref()
             == Some(std::ffi::OsStr::new("whole_file"))
     })
 }
@@ -805,7 +805,7 @@ fn replay_changesets(
     let mut txs = 0u64;
     let repo_id = store.write(|c| c.create_repo(name))?;
     txs += 1;
-    // The mutation lever the ceiling test flips (SCION_RESTORE_MUTATION
+    // The mutation lever the ceiling test flips (SCION_TEST_RESTORE_MUTATION
     // = whole_file, test-hooks only): the replay reads the whole
     // changesets.bin into memory before it stores a row, which is
     // exactly the whole-history read the streaming replay replaced.
@@ -872,13 +872,13 @@ fn replay_changesets(
 /// holds one changeset in memory at a time.
 const DEFAULT_TX_BYTES: usize = 64 * 1024 * 1024;
 
-/// The replay's transaction byte budget: `SCION_RESTORE_TX_BYTES` when
+/// The replay's transaction byte budget: `SCION_TEST_RESTORE_TX_BYTES` when
 /// a test's child process names one, the caller's budget otherwise.
 /// Test-hooks only: a default build never reads the environment, so a
 /// value set around a release binary cannot change a restore.
 #[cfg(any(test, feature = "test-hooks"))]
 fn replay_tx_bytes(asked: usize) -> usize {
-    std::env::var("SCION_RESTORE_TX_BYTES")
+    std::env::var("SCION_TEST_RESTORE_TX_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|v| *v > 0)
@@ -903,7 +903,7 @@ fn restore_batch_note(name: &str, batch: u64) {
     // test-hooks only, so a default build's stderr is the operator's,
     // whatever the environment says.
     #[cfg(any(test, feature = "test-hooks"))]
-    if std::env::var_os("SCION_RESTORE_ECHO_BATCH").is_some() {
+    if std::env::var_os("SCION_TEST_RESTORE_ECHO_BATCH").is_some() {
         eprintln!("restore: {name} batch {batch} committed");
     }
 }

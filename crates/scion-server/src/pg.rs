@@ -2018,8 +2018,13 @@ pub(crate) fn reset_own_staging(url: &str, ca: Option<&Path>) -> Result<()> {
         .map_err(|error| {
             Error::Corrupt(format!("the database answers no current schema: {error}"))
         })?;
+    // The name rides as an identifier, quoted the way reset_schema
+    // quotes it: a schema whose name holds a quote or a space is still
+    // one name, and a raw interpolation here is a SQL injection the
+    // URL's search_path reaches.
+    let quoted = schema.replace('"', "\"\"");
     if let Err(why) = client.batch(&format!(
-        "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}"
+        "DROP SCHEMA IF EXISTS \"{quoted}\" CASCADE; CREATE SCHEMA \"{quoted}\""
     )) {
         return Err(Error::Corrupt(format!(
             "the staging schema {schema} is left behind: {why}; the next restore's start resets it"
