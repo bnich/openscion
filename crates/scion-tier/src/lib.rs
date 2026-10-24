@@ -491,13 +491,24 @@ impl<S: Store> Tier<S> {
             "a ticket-verifying tier needs at least one public key (the hex \
              that `scion-server ticket-key` printed)"
         );
-        Self::build(store, upstream, upstream_token, timeout, client_tls, ticket_keys)
+        Self::build(
+            store,
+            upstream,
+            upstream_token,
+            timeout,
+            client_tls,
+            ticket_keys,
+        )
     }
 
     /// The daemon's tier: it relays the ticket its caller presents,
     /// unverified, and its upstream does the checking (the daemon's
     /// socket is 0600 in a private directory, so the caller is the one
     /// OS user that owns the socket).
+    ///
+    /// # Errors
+    ///
+    /// A bad upstream address, or a client TLS that cannot load.
     #[allow(clippy::needless_pass_by_value)]
     pub fn new_relay(
         store: S,
@@ -506,7 +517,14 @@ impl<S: Store> Tier<S> {
         timeout: Duration,
         client_tls: Option<&ClientTls>,
     ) -> anyhow::Result<Self> {
-        Self::build(store, upstream, upstream_token, timeout, client_tls, Vec::new())
+        Self::build(
+            store,
+            upstream,
+            upstream_token,
+            timeout,
+            client_tls,
+            Vec::new(),
+        )
     }
 
     fn build(

@@ -761,15 +761,7 @@ async fn each_tier_refuses_a_call_without_the_token() {
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.path().join("daemon.sock");
     let store = DiskStore::open(&dir.path().join("data"), 1 << 20).unwrap();
-    let daemon = Tier::new_relay(
-        store,
-        &cache_url,
-        TOKEN,
-        CACHE_UPSTREAM_TIMEOUT,
-        None,
-        
-    )
-    .unwrap();
+    let daemon = Tier::new_relay(store, &cache_url, TOKEN, CACHE_UPSTREAM_TIMEOUT, None).unwrap();
     let incoming = UnixListenerStream::new(bind_unix(&socket).await.unwrap());
     tokio::spawn(daemon.clone().serve(
         TOKEN,
@@ -1255,7 +1247,6 @@ async fn serve_daemon(
         TOKEN,
         CACHE_UPSTREAM_TIMEOUT,
         Some(&client_tls),
-        
     )
     .unwrap();
     let incoming = UnixListenerStream::new(bind_unix(&socket).await.unwrap());
@@ -1333,7 +1324,6 @@ async fn an_https_upstream_needs_a_ca() {
         TOKEN,
         CACHE_UPSTREAM_TIMEOUT,
         None,
-        
     );
     assert!(tier.is_err());
 }
@@ -1352,15 +1342,7 @@ async fn a_daemon_miss_fetches_the_object_only() {
     let socket = dir.path().join("daemon.sock");
     let store = DiskStore::open(&dir.path().join("data"), 1 << 20).unwrap();
     // No ticket keys: a daemon, which checks no ticket and runs no walk.
-    let daemon = Tier::new_relay(
-        store,
-        &cache_url,
-        TOKEN,
-        CACHE_UPSTREAM_TIMEOUT,
-        None,
-        
-    )
-    .unwrap();
+    let daemon = Tier::new_relay(store, &cache_url, TOKEN, CACHE_UPSTREAM_TIMEOUT, None).unwrap();
     let incoming = UnixListenerStream::new(bind_unix(&socket).await.unwrap());
     tokio::spawn(daemon.clone().serve(
         TOKEN,
@@ -1517,15 +1499,7 @@ async fn a_daemons_cache_still_refuses_a_view_ticket_outside_its_view() {
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.path().join("daemon.sock");
     let store = DiskStore::open(&dir.path().join("data"), 1 << 20).unwrap();
-    let daemon = Tier::new_relay(
-        store,
-        &cache_url,
-        TOKEN,
-        CACHE_UPSTREAM_TIMEOUT,
-        None,
-        
-    )
-    .unwrap();
+    let daemon = Tier::new_relay(store, &cache_url, TOKEN, CACHE_UPSTREAM_TIMEOUT, None).unwrap();
     let incoming = UnixListenerStream::new(bind_unix(&socket).await.unwrap());
     tokio::spawn(daemon.clone().serve(
         TOKEN,
@@ -1665,15 +1639,7 @@ async fn a_daemon_killed_mid_fill_serves_no_torn_object_after_its_restart() {
     // its own bytes: the copies that the kill cut arrive from upstream
     // again, and no torn file is served on the way (reads go on).
     let store = DiskStore::open(&data, limit).unwrap();
-    let restarted = Tier::new_relay(
-        store,
-        &upstream,
-        TOKEN,
-        CACHE_UPSTREAM_TIMEOUT,
-        None,
-        
-    )
-    .unwrap();
+    let restarted = Tier::new_relay(store, &upstream, TOKEN, CACHE_UPSTREAM_TIMEOUT, None).unwrap();
     let socket = dir.path().join("daemon-restarted.sock");
     let incoming = UnixListenerStream::new(bind_unix(&socket).await.unwrap());
     let serve_task = tokio::spawn(restarted.clone().serve(

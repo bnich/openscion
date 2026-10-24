@@ -3,14 +3,13 @@
 //! mode is an explicit choice of its own constructor.
 
 use std::io::Read as _;
-use std::io::Write as _;
 use std::process::{Command, Stdio};
 
 #[test]
 fn a_cache_without_a_public_key_does_not_start() {
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("cache.log");
-    let mut log_file = std::fs::File::create(&log).unwrap();
+    let log_file = std::fs::File::create(&log).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_scion-cache"))
         .args([
             "--listen",
