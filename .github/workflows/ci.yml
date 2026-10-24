@@ -492,9 +492,11 @@ jobs:
       # on read paths too, so neither proves anything.
       - run: |
           cargo build -p open-scion --release
-          default=$(nm target/release/scn | grep -cE '3vfs(10write_file|13write_deletes)')
+          # grep -c exits 1 when it prints 0, and a step runs bash -e:
+          # the good case would kill the step before the ifs run.
+          default=$(nm target/release/scn | grep -cE '3vfs(10write_file|13write_deletes)' || true)
           cargo build -p open-scion --release --features unstable-writable-mount
-          feat=$(nm target/release/scn | grep -cE '3vfs(10write_file|13write_deletes)')
+          feat=$(nm target/release/scn | grep -cE '3vfs(10write_file|13write_deletes)' || true)
           echo "write-path symbols: default=$default feature=$feat"
           if [ "$default" != 0 ]; then
             echo "the default release scn carries a write-path symbol" >&2
