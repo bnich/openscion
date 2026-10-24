@@ -588,8 +588,10 @@ async fn restore_command(
             .context("cannot read /proc/self/status")?;
         for line in status.lines() {
             if let Some(kb) = line.strip_prefix("VmHWM:") {
+                // The number only: the ceiling test parses the rest of
+                // this line as the peak.
                 println!(
-                    "restore: peak RSS {} kB",
+                    "restore: peak RSS {}",
                     kb.trim().trim_end_matches("kB").trim()
                 );
             }

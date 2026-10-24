@@ -408,5 +408,10 @@ fn restore_sampled(archive: &std::path::Path, target: &std::path::Path) -> u64 {
         .filter_map(|line| line.strip_prefix("restore: peak RSS "))
         .collect();
     assert_eq!(peaks.len(), 1, "the child named its peak once: {stdout}");
-    peaks[0].trim().parse().unwrap_or(0)
+    // A peak line that does not parse is a bug in the seam, not a
+    // small process: fail loudly instead of measuring zero.
+    peaks[0]
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("the child's peak line does not parse: {peaks[0]:?}: {e}"))
 }
