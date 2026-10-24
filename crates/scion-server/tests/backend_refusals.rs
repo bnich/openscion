@@ -777,10 +777,7 @@ fn a_lost_marker_written_back_as_the_runbook_says_reopens_the_store() {
     let Err(still) = Backend::open(dir.path(), Some(&db.url_riding(Some("a"))), None) else {
         panic!("a marker whose UUID line is not 32 hex digits opens a store");
     };
-    assert!(
-        still.to_string().contains("carries no marker"),
-        "{still}"
-    );
+    assert!(still.to_string().contains("carries no marker"), "{still}");
     let marker = dir.path().join("backend");
     let out = Command::new("sh")
         .arg("-c")
