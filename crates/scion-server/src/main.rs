@@ -27,19 +27,20 @@ use tracing_subscriber::EnvFilter;
 #[command(version, about, long_about = None)]
 struct Cli {
     /// The data directory. Holds the SQLite database and the objects.
-    #[arg(long, env = "SCION_DATA", default_value = "scion-data")]
+    #[arg(long, global = true, env = "SCION_DATA", default_value = "scion-data")]
     data: PathBuf,
     /// Serve metadata from Postgres at this URL instead of the SQLite
     /// database of the data directory. The URL holds the credentials, so it
     /// is never logged. Prefer `--postgres-url-file` or `SCION_POSTGRES_URL`:
     /// a URL on the command line is readable by every local account (`ps`).
-    #[arg(long, value_name = "URL")]
+    #[arg(long, global = true, value_name = "URL")]
     postgres_url: Option<String>,
     /// File with the Postgres URL, read like the access file: the owner
     /// alone may read it, and a symlink is refused. Give `--postgres-url`
     /// or `--postgres-url-file`, not both.
     #[arg(
         long,
+        global = true,
         conflicts_with = "postgres_url",
         env = "SCION_POSTGRES_URL_FILE",
         value_name = "FILE"
@@ -47,7 +48,7 @@ struct Cli {
     postgres_url_file: Option<PathBuf>,
     /// Verify the certificate of the Postgres server with this CA (PEM).
     /// Required when `--postgres-url` names a host that is not local.
-    #[arg(long, requires = "postgres_url", value_name = "FILE")]
+    #[arg(long, global = true, requires = "postgres_url", value_name = "FILE")]
     postgres_ca: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
