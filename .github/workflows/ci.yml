@@ -135,6 +135,7 @@ jobs:
               crates/scn/src/cmd/mount.rs|\
               crates/scn/src/cmd/commit.rs|\
               crates/scn/tests/from_mount.rs) mount=true ;;
+            esac
             # A dependency surface: any manifest, any lockfile (the
             # root's or a fuzz workspace's), the deny configuration a
             # lockfile is checked against, and the coverage script
@@ -480,6 +481,21 @@ jobs:
       # The feature build's tests: the write-side unit tests of the VFS
       # and the from-mount suite, which the default build compiles out.
       - run: cargo test -p open-scion --features unstable-writable-mount
+      # The release profile never builds the feature, so a default
+      # release scn holds no write symbol of the VFS crate: the write
+      # path is compiled out, not switched off. nm fails the job if
+      # one shows up. The pattern is the VFS crate's mangled module
+      # path with a write name - on the feature build it matches 7
+      # symbols today, so the check has teeth (the fn name itself is
+      # inlined and would prove nothing).
+      - run: |
+          cargo build -p open-scion --release
+          if nm target/release/scn | grep 'open_scion3vfs' | grep -qiE 'write'; then
+            echo "the default release scn carries a VFS write symbol" >&2
+            nm target/release/scn | grep 'open_scion3vfs' | grep -iE 'write' >&2
+            exit 1
+          fi
+          echo "the default release scn has no VFS write symbol"
 
   test-macos:
     name: test (macOS)
