@@ -53,6 +53,12 @@ impl ReplyMemoryLayer {
     }
 }
 
+/// The encoded size of a unary reply, set by the handler that built
+/// it, so the budget counts bytes it cannot learn from the body (a
+/// tonic-encoded body carries no exact size hint).
+#[derive(Clone, Copy)]
+pub(crate) struct ReplySize(pub usize);
+
 /// The reply body that holds the budget permit until it ends.
 struct CountedReply<B> {
     inner: B,
@@ -109,12 +115,60 @@ where
     fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
         let budget = Arc::clone(&self.budget);
         let future = self.inner.call(request);
+        // MUTATION levers for the tests' red proofs: "uncounted" never
+        // takes the share (a parked reply holds nothing the budget
+        // knows of); "held_forever" takes it and never gives it back
+        // (a reset cannot free it). Release builds never read these.
+        #[cfg(any(test, feature = "test-hooks"))]
+        match std::env::var_os("SCION_REPLY_MUTATION").as_deref() {
+            Some(x) if x == "uncounted" => {
+                return Box::pin(async move {
+                    let (parts, body) = future.await?.into_parts();
+                    Ok(http::Response::from_parts(
+                        parts,
+                        tonic::body::Body::new(body),
+                    ))
+                });
+            }
+            Some(x) if x == "held_forever" => {
+                return Box::pin(async move {
+                    let response = future.await?;
+                    let size = response.extensions().get::<ReplySize>().map_or(0, |s| s.0);
+                    // Count as the real path does, but leak the permit:
+                    // no reset can ever free it.
+                    if size > 0
+                        && let Err(_) = budget
+                            .clone()
+                            .try_acquire_many_owned(u32::try_from(size).unwrap_or(u32::MAX))
+                    {
+                        let mut refusal = http::Response::new(tonic::body::Body::empty());
+                        refusal.headers_mut().insert(
+                            tonic::Status::GRPC_STATUS,
+                            http::HeaderValue::from_static("8"),
+                        );
+                        return Ok(refusal);
+                    }
+                    let (parts, body) = response.into_parts();
+                    Ok(http::Response::from_parts(
+                        parts,
+                        tonic::body::Body::new(body),
+                    ))
+                });
+            }
+            _ => {}
+        }
         Box::pin(async move {
             let response = future.await?;
-            // A streaming reply's size is unknown; it holds its own
-            // share from the read budget instead. An exact size names
-            // a unary reply, whose bytes the server parks whole.
-            let size = response.body().size_hint().exact().unwrap_or(0);
+            // The size is what the handler knew when it built the
+            // reply (its encoded length, set as a response extension),
+            // else the body's exact hint. A streaming reply names
+            // neither and holds its own share from the read budget.
+            let size = if let Some(ReplySize(size)) = response.extensions().get::<ReplySize>() {
+                *size
+            } else {
+                usize::try_from(response.body().size_hint().exact().unwrap_or(0))
+                    .unwrap_or(usize::MAX)
+            };
             let permit = if size == 0 {
                 None
             } else if let Ok(permit) = budget

@@ -494,6 +494,18 @@ impl ScionService {
     }
 
     /// Sends `data` in parts, holding `share` for the whole reply.
+    /// Marks a unary reply so the reply-memory layer counts its
+    /// parked bytes: the handler knows the encoded size here, before
+    /// the response returns, which the encoded body never reveals.
+    fn count_reply<M: prost::Message>(response: Response<M>) -> Response<M> {
+        let mut response = response;
+        let size = response.get_ref().encoded_len();
+        response
+            .extensions_mut()
+            .insert(crate::reply::ReplySize(size));
+        response
+    }
+
     fn stream_whole_holding<T: Send + 'static>(
         _self: &Self,
         call: Call,
@@ -1498,9 +1510,9 @@ impl Scion for ScionService {
             })
             .await;
         let id = written??;
-        Ok(Response::new(PutBlobResponse {
+        Ok(Self::count_reply(Response::new(PutBlobResponse {
             blob_id: id.as_bytes().to_vec(),
-        }))
+        })))
     }
 
     async fn create_changeset(
@@ -1596,9 +1608,9 @@ impl Scion for ScionService {
             })
             .await;
         let id = outcome??;
-        Ok(Response::new(CreateChangesetResponse {
+        Ok(Self::count_reply(Response::new(CreateChangesetResponse {
             changeset_id: id.as_bytes().to_vec(),
-        }))
+        })))
     }
 
     async fn land(
@@ -2134,9 +2146,9 @@ impl Scion for ScionService {
                 read::merge_base(store, &req.repo, a, b, deadline)
             })
             .await?;
-        Ok(Response::new(MergeBaseResponse {
+        Ok(Self::count_reply(Response::new(MergeBaseResponse {
             changeset_ids: bases.iter().map(|id| id.as_bytes().to_vec()).collect(),
-        }))
+        })))
     }
 
     async fn is_ancestor(
@@ -2155,7 +2167,9 @@ impl Scion for ScionService {
                 read::is_ancestor(store, &req.repo, ancestor, descendant, deadline)
             })
             .await?;
-        Ok(Response::new(IsAncestorResponse { is_ancestor }))
+        Ok(Self::count_reply(Response::new(IsAncestorResponse {
+            is_ancestor,
+        })))
     }
 
     async fn diff(&self, request: Request<DiffRequest>) -> Result<Response<DiffResponse>, Status> {
@@ -2212,11 +2226,11 @@ impl Scion for ScionService {
                 }
             })
             .collect();
-        Ok(Response::new(DiffResponse {
+        Ok(Self::count_reply(Response::new(DiffResponse {
             entries,
             next_after: path_bytes(page.next_after),
             renames_incomplete: page.renames_incomplete,
-        }))
+        })))
     }
 }
 
