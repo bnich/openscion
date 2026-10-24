@@ -153,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
+    scion_tier::refuse_missing_data_dir(&cli.data)?;
     let (token, upstream) = resolve_tokens(&cli)?;
     anyhow::ensure!(
         cli.seed.is_empty() || cli.seed_full_repo,
@@ -162,6 +163,7 @@ async fn main() -> anyhow::Result<()> {
          reader; pass --seed-full-repo when every user of this daemon may \
          read the repo whole"
     );
+    scion_tier::refuse_missing_data_dir(&cli.data)?;
     let store = DiskStore::open(&cli.data, cli.max_bytes)
         .with_context(|| format!("cannot open data directory {}", cli.data.display()))?;
     let client_tls = ClientTls::load(

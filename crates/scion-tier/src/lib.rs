@@ -1415,6 +1415,27 @@ impl<S: Store> Objects for Tier<S> {
     }
 }
 
+/// # Errors
+/// The directory is not a directory, or does not exist.
+///
+/// Refuses a data directory that does not exist, with the server's
+/// message shape: a typo in `--data`, or a run from the wrong folder,
+/// must not make a new empty store and serve from it. The daemon's
+/// `--data` defaults to a working-directory-relative name, so the
+/// refusal runs before the store is opened, wherever the binary runs.
+pub fn refuse_missing_data_dir(data: &std::path::Path) -> anyhow::Result<()> {
+    if data.is_dir() {
+        return Ok(());
+    }
+    if data.exists() {
+        return Err(anyhow::anyhow!("{} is not a directory", data.display()));
+    }
+    Err(anyhow::anyhow!(
+        "{} does not exist; create it or pass --data",
+        data.display()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
 
