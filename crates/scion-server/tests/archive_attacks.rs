@@ -798,6 +798,90 @@ fn a_stopped_store_in_a_search_path_schema_is_refused_whole() {
         .unwrap();
 }
 
+/// R1: the guards quote the schema as an identifier in the database,
+/// so a mixed-case name is the name the guards read and the drop
+/// drops - not a case-folded lookup over `store` while the drop tears
+/// `Stopped_Store` down. A lowercase twin schema sits beside it, empty,
+/// and must stay empty: the guards must read the `search_path`'s schema,
+/// never the fold. Red on 1d5b54b7: the guards read the fold.
+#[test]
+fn a_mixed_case_schema_is_read_and_dropped_as_itself() {
+    let Ok(base) = std::env::var("SCION_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let name = format!("scion_restore_attack_case_{}", std::process::id());
+    let mut maker = postgres::Client::connect(&base, postgres::NoTls).unwrap();
+    maker
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {name}"))
+        .unwrap();
+    maker
+        .batch_execute(&format!("CREATE DATABASE {name}"))
+        .unwrap();
+    let root = base
+        .rsplit_once('/')
+        .map_or(base.as_str(), |(rest, _)| rest);
+    let plain = format!("{root}/{name}");
+    // The store's schema is mixed case; the twin is its case fold. The
+    // URL's search_path names the mixed-case one, quoted, because a
+    // search_path with an upper-case member needs the quotes.
+    postgres::Client::connect(&plain, postgres::NoTls)
+        .unwrap()
+        .batch_execute("CREATE SCHEMA \"Stopped_Store\"; CREATE SCHEMA stopped_store")
+        .unwrap();
+    let url = format!("{plain}?options=--search_path%3D%22Stopped_Store%22%2Cpublic");
+    let (_keep, out, _main, _second) = sound_archive();
+    let target = tempfile::tempdir().unwrap().path().join("restored-case");
+    std::fs::create_dir_all(&target).unwrap();
+    archive::restore(&out, &target, Some(&url), None)
+        .unwrap_or_else(|e| panic!("restore A failed: {e:#}"));
+    let mut check = postgres::Client::connect(&plain, postgres::NoTls).unwrap();
+    let repos_before: i64 = check
+        .query_one("SELECT count(*) FROM \"Stopped_Store\".repos", &[])
+        .unwrap()
+        .get(0);
+    let twin_absent: bool = check
+        .query_opt("SELECT to_regclass('stopped_store.repos')::text", &[])
+        .unwrap()
+        .and_then(|row| row.get::<_, Option<String>>(0))
+        .is_none();
+    drop(check);
+    assert!(
+        repos_before >= 1,
+        "restore A landed its repos in the mixed-case schema"
+    );
+    // Restore B at the same URL: refused - the stopped store's rows
+    // decide - and the twin stays untouched.
+    let target_b = tempfile::tempdir().unwrap().path().join("restored-case-b");
+    std::fs::create_dir_all(&target_b).unwrap();
+    assert!(
+        archive::restore(&out, &target_b, Some(&url), None).is_err(),
+        "a restore at a stopped store's mixed-case schema must refuse"
+    );
+    let mut check = postgres::Client::connect(&plain, postgres::NoTls).unwrap();
+    let repos_after: i64 = check
+        .query_one("SELECT count(*) FROM \"Stopped_Store\".repos", &[])
+        .unwrap()
+        .get(0);
+    let twin_after_absent: bool = check
+        .query_opt("SELECT to_regclass('stopped_store.repos')::text", &[])
+        .unwrap()
+        .and_then(|row| row.get::<_, Option<String>>(0))
+        .is_none();
+    drop(check);
+    assert_eq!(
+        repos_after, repos_before,
+        "the refused restore must leave the store's rows unchanged"
+    );
+    assert!(twin_absent, "the twin starts empty");
+    assert!(
+        twin_after_absent,
+        "the twin stays empty: the guards read the search_path's schema, never the fold"
+    );
+    maker
+        .batch_execute(&format!("DROP DATABASE {name}"))
+        .unwrap();
+}
+
 /// The published store must not carry the mark (Y1): restore A lands,
 /// a server serves it and lands one more change, the server stops, and
 /// restore B at the same URL must refuse - not drop a real store as a
@@ -1054,4 +1138,95 @@ fn a_kill_between_repos_resets_cleanly_on_the_next_restore() {
     maker
         .batch_execute(&format!("DROP DATABASE {name}"))
         .unwrap();
+}
+
+/// R2: a zero-repo archive leaves the staging mark OFF. The replay
+/// loop never runs, so with no clear of its own the mark rides into
+/// the published store - and after clients write repos, a restore at
+/// that URL reads the mark as a leftover and drops a real store. Red
+/// on the code without the zero-repo clear. Runs only where
+/// `SCION_TEST_POSTGRES_URL` names the job's own scratch instance.
+#[test]
+fn a_zero_repo_archive_leaves_no_staging_mark() {
+    let Ok(base) = std::env::var("SCION_TEST_POSTGRES_URL") else {
+        return;
+    };
+    // The store that makes the archive lives in one scratch database;
+    // the restore lands in a second, so the target starts fresh.
+    let a = format!("scion_restore_attack_empty_a_{}", std::process::id());
+    let b = format!("scion_restore_attack_empty_b_{}", std::process::id());
+    let mut maker = postgres::Client::connect(&base, postgres::NoTls).unwrap();
+    for name in [&a, &b] {
+        maker
+            .batch_execute(&format!("DROP DATABASE IF EXISTS {name}"))
+            .unwrap();
+        maker
+            .batch_execute(&format!("CREATE DATABASE {name}"))
+            .unwrap();
+    }
+    let root = base
+        .rsplit_once('/')
+        .map_or(base.as_str(), |(rest, _)| rest);
+    let url_a = format!("{root}/{a}");
+    let url_b = format!("{root}/{b}");
+    // The archive of an empty store: the manifest carries "repos": [].
+    let data = tempfile::tempdir().unwrap();
+    let store = Backend::open(data.path(), Some(&url_a), None).unwrap();
+    drop(store);
+    let (_keep, out) = {
+        let parent = tempfile::tempdir().unwrap();
+        let out = parent.path().join("archive");
+        let store = Backend::open(data.path(), Some(&url_a), None).unwrap();
+        archive::export(&store, data.path(), None, true, &out).unwrap();
+        drop(store);
+        (parent, out)
+    };
+    let manifest = std::fs::read_to_string(out.join("manifest.json")).unwrap();
+    assert!(
+        manifest.contains(r#""repos": []"#),
+        "the fixture is an empty archive: {manifest}"
+    );
+    // The restore lands an empty store in the fresh database.
+    let target = tempfile::tempdir().unwrap().path().join("restored-empty");
+    std::fs::create_dir_all(&target).unwrap();
+    archive::restore(&out, &target, Some(&url_b), None)
+        .unwrap_or_else(|e| panic!("the empty restore failed: {e:#}"));
+    // The published store must not carry the mark: a store with no
+    // repos is still a store, and clients will write repos into it.
+    let mut check = postgres::Client::connect(&url_b, postgres::NoTls).unwrap();
+    let mark: Option<String> = check
+        .query_one("SELECT to_regclass('restore_staging')::text", &[])
+        .unwrap()
+        .get(0);
+    drop(check);
+    assert!(
+        mark.is_none(),
+        "a published empty store carries the staging mark: {mark:?}"
+    );
+    // The end-to-end form: a client writes one repo into the restored
+    // store, then a second restore at that URL must refuse - and with
+    // the mark gone it does, for the right reason: the rows, not a
+    // leftover mark.
+    let grown = Backend::open(&target, Some(&url_b), None).unwrap();
+    grown.write(|c| c.create_repo("grown").map(|_| ())).unwrap();
+    drop(grown);
+    // A fresh target: the refusal must come from the rows at the URL,
+    // not from the target directory already holding a store.
+    let target_b = tempfile::tempdir().unwrap().path().join("restored-empty-b");
+    std::fs::create_dir_all(&target_b).unwrap();
+    let second = archive::restore(&out, &target_b, Some(&url_b), None);
+    assert!(
+        second.is_err(),
+        "a second restore at a stopped store's URL must refuse"
+    );
+    let why = format!("{:#}", second.unwrap_err());
+    assert!(
+        why.contains("refuses to drop"),
+        "the refusal must protect the rows, not a leftover mark: {why}"
+    );
+    for name in [&a, &b] {
+        maker
+            .batch_execute(&format!("DROP DATABASE {name}"))
+            .unwrap();
+    }
 }

@@ -1913,26 +1913,25 @@ pub(crate) fn reset_schema(url: &str, ca: Option<&Path>) -> Result<()> {
             "the URL's search_path names no existing schema; create it first".into(),
         ));
     };
-    // The identifier, quoted the way to_regclass and the DDL want it:
-    // a schema name with a quote or a space is still one name.
-    let quoted = schema.replace('"', "\"\"");
     // The drop's only other guard is what the schema holds: this is the
     // one check a stopped store's URL cannot escape - a stopped server
     // holds no lock, so the schema's own rows decide. A schema that
     // carries a store's identity and no restore's staging mark is a
     // real store: refused, unchanged, whatever the lock says. The
-    // lookup is qualified with the resolved schema, never a hard-wired
-    // `public`: the guards and the drop act on the same name.
+    // lookups take the schema as a bind parameter and quote it as an
+    // identifier in the database (format %I), so a mixed-case name, a
+    // quote or a space is still the one name the guards and the drop
+    // act on - never the hard-wired `public`.
     let staging: Option<String> = client
         .query_opt(
-            &format!("SELECT to_regclass('{quoted}.restore_staging')::text"),
-            &[],
+            "SELECT to_regclass(format('%I.restore_staging', $1::text))::text",
+            &[Param::text(schema.clone())],
         )?
         .and_then(|row| row.get::<_, Option<String>>(0));
     let named: Option<String> = client
         .query_opt(
-            &format!("SELECT to_regclass('{quoted}.store_uuid')::text"),
-            &[],
+            "SELECT to_regclass(format('%I.store_uuid', $1::text))::text",
+            &[Param::text(schema.clone())],
         )?
         .and_then(|row| row.get::<_, Option<String>>(0));
     if staging.is_none() && named.is_some() {
@@ -1944,14 +1943,14 @@ pub(crate) fn reset_schema(url: &str, ca: Option<&Path>) -> Result<()> {
     }
     if staging.is_none() && named.is_none() {
         // Not ours and not a store: a schema with other objects is not
-        // a restore's leftover, and nothing here may drop it.
-        let escaped = schema.replace('\'', "''");
+        // a restore's leftover, and nothing here may drop it. The
+        // schema rides a bind parameter: no case folding, no literal
+        // escape, whatever the name carries.
         let foreign: i64 = client.query(
-            &format!(
-                "SELECT count(*) FROM pg_catalog.pg_class \
-                 WHERE relnamespace = '{escaped}'::regnamespace AND relkind = 'r'"
-            ),
-            &[],
+            "SELECT count(*) FROM pg_catalog.pg_class \
+                 WHERE relnamespace = (SELECT oid FROM pg_namespace \
+                 WHERE nspname = $1) AND relkind = 'r'",
+            &[Param::text(schema.clone())],
         )?[0]
             .get(0);
         if foreign > 0 {
@@ -1969,7 +1968,9 @@ pub(crate) fn reset_schema(url: &str, ca: Option<&Path>) -> Result<()> {
         "SET lock_timeout = '{RESET_LOCK_TIMEOUT}'; SET statement_timeout = '{RESET_STATEMENT_TIMEOUT}'"
     ))?;
     // One batch: a crash between the drop and the create would leave
-    // the next open a database with no schema to land in.
+    // the next open a database with no schema to land in. The name is
+    // quoted as an identifier, so a mixed-case schema drops exactly.
+    let quoted = schema.replace('"', "\"\"");
     if let Err(why) = client.batch(&format!(
         "DROP SCHEMA IF EXISTS \"{quoted}\" CASCADE; CREATE SCHEMA \"{quoted}\""
     )) {
@@ -2183,9 +2184,6 @@ fn pg_error_of(code: Option<&str>, e: postgres::Error) -> Error {
         // foreign key) is one answer among many: it logs quietly.
         Some(code) if code.starts_with("23") => {
             tracing::debug!("the database refused a statement: {e}");
-            if let Some(db) = e.as_db_error() {
-                tracing::debug!("PROBE code {} message {}", code, db.message());
-            }
             Error::Storage(Storage::internal(e))
         }
         // Out of space: the same shortage, wherever the metadata lives.

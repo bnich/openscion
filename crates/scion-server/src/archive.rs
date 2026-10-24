@@ -728,6 +728,14 @@ fn restore_into_with(
             std::process::exit(9);
         }
     }
+    if small_sections.is_empty() {
+        // No repos, no loop, no publication transaction to carry the
+        // clear: the mark leaves in a transaction of its own. Nothing
+        // is partial with zero repos - an empty store is a complete
+        // store, and clients will write repos into it.
+        store.write(|c| c.clear_restore_mark())?;
+        txs += 1;
+    }
     note_restore_txs(txs);
     Ok(RestoreReport {
         repos: names,
