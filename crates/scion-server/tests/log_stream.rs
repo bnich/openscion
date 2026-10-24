@@ -190,9 +190,12 @@ impl<'a> MakeWriter<'a> for Captured {
 fn close_watchdog(seconds: u64) -> std::sync::mpsc::Sender<()> {
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
-        if rx
-            .recv_timeout(std::time::Duration::from_secs(seconds))
-            .is_err()
+        // Only a real timeout may end the run: Disconnected (the test
+        // dropped the sender - a panic, an assert, an early return)
+        // means the run already ended, and the watchdog has nothing to
+        // add. Both other outcomes end silently.
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+            rx.recv_timeout(std::time::Duration::from_secs(seconds))
         {
             eprintln!(
                 "the stalled connection was never closed within {seconds} s: the stall cap never fired"
