@@ -30,15 +30,19 @@ const TOKEN: &str = "secret";
 /// One directory wide enough that one `ListDir` reply's tree body is
 /// about 2 MB (13,000 entries of 120 characters).
 const NAMES: usize = 13_000;
-/// Held unread streams: 200 bodies of about 2 MB is about 416 MB, at
-/// least 1.5x the 256 MiB read budget, so the right order MUST queue
-/// some builds and the old order MUST pass the ceiling.
-const STREAMS: usize = 200;
-/// The streams ride 8 connections: 25 replies of 2 MB is about 50 MB
+/// Held unread streams: 360 bodies of about 2 MB is about 749 MB of
+/// live bytes under the old order, more than the whole ceiling
+/// (baseline + two budgets + slack), so the old order passes it by its
+/// live bytes alone - the red cannot ride on how the allocator treats
+/// freed copies. The right order caps live bodies at the budget
+/// (about 130), and its measured run (CI 40103512403) lands at 545 MB
+/// over baseline, under that ceiling.
+const STREAMS: usize = 360;
+/// The streams ride 18 connections: 20 replies of 2 MB is about 42 MB
 /// per connection, under the 64 MiB stalled-bytes cap that would
 /// otherwise close a connection and free what it holds - the test must
 /// measure the read budget, not the stall cap.
-const CONNECTIONS: usize = 8;
+const CONNECTIONS: usize = 18;
 /// The ceiling is baseline + TWO read budgets + slack: one budget is
 /// the held bodies' own bytes, the second is the transient copy each
 /// build makes while it encodes (the allocator keeps freed 2 MB blocks

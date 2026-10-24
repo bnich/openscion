@@ -379,6 +379,8 @@ jobs:
             echo "::error::the old build-then-share order passed the RSS bound"
             exit 1
           fi
+          # The red run's own printed line, for the record either way.
+          grep -E "streams hold|kB, after" /tmp/listdir-red.log || true
           grep -q "passed the ceiling" /tmp/listdir-red.log || {
             echo "::error::the lever run failed for another reason:"
             cat /tmp/listdir-red.log
