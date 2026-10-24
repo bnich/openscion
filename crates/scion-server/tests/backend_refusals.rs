@@ -761,6 +761,26 @@ fn a_lost_marker_written_back_as_the_runbook_says_reopens_the_store() {
         + "names the store ".len();
     let uuid = &message[start..start + 32];
     assert!(uuid.bytes().all(|b| b.is_ascii_hexdigit()), "{message}");
+    // A marker whose UUID line is not 32 hex digits counts as no UUID
+    // at all: the open refuses again with the same message, exactly as
+    // it did without the file. The runbook's write is the only one that
+    // reopens the store.
+    let dashed = format!(
+        "postgres\n{}-{}-{}-{}-{}\n",
+        &uuid[..8],
+        &uuid[8..12],
+        &uuid[12..16],
+        &uuid[16..20],
+        &uuid[20..]
+    );
+    std::fs::write(dir.path().join("backend"), &dashed).unwrap();
+    let Err(still) = Backend::open(dir.path(), Some(&db.url_riding(Some("a"))), None) else {
+        panic!("a marker whose UUID line is not 32 hex digits opens a store");
+    };
+    assert!(
+        still.to_string().contains("carries no marker"),
+        "{still}"
+    );
     let marker = dir.path().join("backend");
     let out = Command::new("sh")
         .arg("-c")

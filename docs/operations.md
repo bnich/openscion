@@ -348,9 +348,11 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
 
   then start the server. Do NOT do this for a directory the database
   was never served with: its blob files are missing, and the correct
-  move is a different directory (`--data`), not a marker. A marker
-  whose UUID line is not 32 hex digits is damage, and the open refuses
-  it as damaged rather than reading it as absent.
+  move is a different directory (`--data`), not a marker. A UUID line
+  that is not 32 hex digits counts as no UUID at all - the open refuses
+  again with the same "carries no marker" message - so check what you
+  wrote (for example `od -c /srv/scion/backend`) before you conclude
+  the re-pairing failed.
 
 Backup and restore of a Postgres-backed server: `pg_dump` the database
 first, then copy the data directory. A changeset in the dump names only
