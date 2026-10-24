@@ -188,18 +188,26 @@ fn a_restore_commits_bounded_transactions_and_answers_like_its_source() {
 
 /// The nightly ceiling: a big archive, restored by the `scion-server
 /// restore` subcommand in its own process, whose peak RSS the test
-/// samples. The archive's `changesets.bin` must be at least twice the
-/// ceiling, so the old whole-file read would blow it and the guard is
-/// not vacuous. `SCION_TEST_RESTORE_BIG` arms it, and it runs only in a
-/// release build on CI (the nightly, main and a dispatch): the fixture
-/// holds too much store for a shared dev machine. The size rides the
+/// samples. The bound is self-calibrating: the test first measures an
+/// empty archive's restore in a twin process - that peak is the
+/// binary's own footprint, whatever platform it runs on - and the big
+/// restore must stay under that baseline plus a slack the streamed
+/// replay's own memory (one changeset body, the read buffer) bounds.
+/// A fixed ceiling would pin one platform's allocator. The archive's
+/// `changesets.bin` must be at least twice the slack, so the old
+/// whole-file read would blow the bound and the guard is not vacuous.
+/// `SCION_TEST_RESTORE_BIG` arms it, and it runs only in a release
+/// build on CI (the nightly, main and a dispatch): the fixture holds
+/// too much store for a shared dev machine. The size rides the
 /// changesets' messages: a few changesets with big bodies fill the
 /// archive without the store a long chain would grow.
 #[test]
 fn a_big_restore_stays_under_its_rss_ceiling() {
     const CHAIN_BIG: usize = 64;
     const MESSAGE_BYTES: usize = 200 * 1024;
-    const CEILING_KB: u64 = 4 * 1024;
+    // The replay's own allowance over the twin's baseline: one
+    // changeset body, the read buffer, the store's open.
+    const SLACK_KB: u64 = 4 * 1024;
     if std::env::var_os("SCION_TEST_RESTORE_BIG").is_none() {
         println!("skipping the big restore: SCION_TEST_RESTORE_BIG arms it");
         return;
@@ -237,61 +245,35 @@ fn a_big_restore_stays_under_its_rss_ceiling() {
         .unwrap()
         .len()
         / 1024;
-    println!("changesets.bin is {bin_len} KiB; the ceiling is {CEILING_KB} KiB");
+    println!("changesets.bin is {bin_len} KiB; the slack is {SLACK_KB} KiB");
     assert!(
-        bin_len >= 2 * CEILING_KB,
-        "changesets.bin ({bin_len} KiB) must be at least twice the ceiling ({CEILING_KB} KiB), \
+        bin_len >= 2 * SLACK_KB,
+        "changesets.bin ({bin_len} KiB) must be at least twice the slack ({SLACK_KB} KiB), \
          or the old whole-file read would fit under it"
     );
 
-    // The restore runs as its own process: the peak RSS measured is the
-    // restore's, not the test fixture's.
-    let target = tempfile::tempdir().unwrap().path().join("restored");
-    std::fs::create_dir_all(&target).unwrap();
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
-        .arg("--data")
-        .arg(&target)
-        .arg("restore")
-        .arg("--archive")
-        .arg(&out)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let pid = child.id();
-    let peak = std::thread::spawn(move || {
-        // VmHWM is the process's high-water mark in kB. The sampler
-        // reads it until the process is gone, and keeps the last value
-        // it saw: the mark never falls.
-        let status = format!("/proc/{pid}/status");
-        let mut last = 0_u64;
-        while let Ok(text) = std::fs::read_to_string(&status) {
-            for line in text.lines() {
-                if let Some(kb) = line.strip_prefix("VmHWM:")
-                    && let Ok(kb) = kb.trim().trim_end_matches("kB").trim().parse::<u64>()
-                {
-                    last = last.max(kb);
-                }
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        last
-    });
-    let output = child.wait_with_output().unwrap();
-    assert!(
-        output.status.success(),
-        "the restore failed:\n{}",
-        String::from_utf8_lossy(&output.stderr)
+    // A restore runs as its own process, so the peak RSS measured is
+    // the restore's, not the test fixture's. The twin first: an empty
+    // archive, restored the same way - its peak is the binary's own
+    // footprint on this machine, and the bound rides on it.
+    let baseline_kb = restore_sampled(
+        &empty_archive(),
+        &tempfile::tempdir().unwrap().path().join("restored-empty"),
     );
-    let peak_kb = peak.join().unwrap();
-    println!("the restore's peak RSS was {peak_kb} kB; the ceiling is {CEILING_KB} kB");
+    let target = tempfile::tempdir().unwrap().path().join("restored");
+    let peak_kb = restore_sampled(&out, &target);
+    println!(
+        "the streamed restore's peak RSS was {peak_kb} kB; \
+         the bound is the twin's baseline {baseline_kb} kB + the replay's slack {SLACK_KB} kB"
+    );
     assert!(
         peak_kb > 0,
         "the sampler saw no peak; this test needs /proc (Linux)"
     );
     assert!(
-        peak_kb <= CEILING_KB,
-        "the restore's peak RSS ({peak_kb} kB) passed the ceiling ({CEILING_KB} kB); \
+        peak_kb <= baseline_kb + SLACK_KB,
+        "the restore's peak RSS ({peak_kb} kB) passed the ceiling \
+         (baseline {baseline_kb} kB + slack {SLACK_KB} kB); \
          a whole-history read is back"
     );
 
@@ -365,4 +347,65 @@ fn a_killed_restore_leaves_the_next_one_clean() {
     assert_restore_equals_source(&store, &restored);
     let problems = fsck::run(&restored, fsck::BATCH, &mut |_| {}).unwrap();
     assert!(problems.problems.is_empty(), "{problems:?}");
+}
+
+/// An archive of a store with no repos: the twin the ceiling test
+/// restores to measure the binary's own footprint.
+fn empty_archive() -> std::path::PathBuf {
+    let data = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let out = parent.path().join("archive-empty");
+    archive::export(&store, data.path(), None, true, &out).unwrap();
+    drop(store);
+    let manifest = std::fs::read_to_string(out.join("manifest.json")).unwrap();
+    assert!(
+        manifest.contains(r#""repos": []"#),
+        "the twin's archive is empty: {manifest}"
+    );
+    // Leak the parents: the archive must outlive the test's restores.
+    std::mem::forget(data);
+    std::mem::forget(parent);
+    out
+}
+
+/// A restore in its own process, with its peak RSS sampled from
+/// `/proc`: `VmHWM` is the process's high-water mark in kB, the mark
+/// never falls, and the sampler keeps the last value it saw.
+fn restore_sampled(archive: &std::path::Path, target: &std::path::Path) -> u64 {
+    std::fs::create_dir_all(target).unwrap();
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
+        .arg("--data")
+        .arg(target)
+        .arg("restore")
+        .arg("--archive")
+        .arg(archive)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let sampler = std::thread::spawn(move || {
+        let status = format!("/proc/{pid}/status");
+        let mut last = 0_u64;
+        while let Ok(text) = std::fs::read_to_string(&status) {
+            for line in text.lines() {
+                if let Some(kb) = line.strip_prefix("VmHWM:")
+                    && let Ok(kb) = kb.trim().trim_end_matches("kB").trim().parse::<u64>()
+                {
+                    last = last.max(kb);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        last
+    });
+    let output = child.wait_with_output().unwrap();
+    let peak = sampler.join().unwrap();
+    assert!(
+        output.status.success(),
+        "the restore failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    peak
 }
