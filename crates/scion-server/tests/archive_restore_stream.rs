@@ -190,7 +190,7 @@ fn a_restore_commits_bounded_transactions_and_answers_like_its_source() {
 /// restore` subcommand in its own process, whose peak RSS the test
 /// samples. The archive's `changesets.bin` must be at least twice the
 /// ceiling, so the old whole-file read would blow it and the guard is
-/// not vacuous. `SCION_RESTORE_BIG` arms it, and it runs only in a
+/// not vacuous. `SCION_TEST_RESTORE_BIG` arms it, and it runs only in a
 /// release build on CI (the nightly, main and a dispatch): the fixture
 /// holds too much store for a shared dev machine. The size rides the
 /// changesets' messages: a few changesets with big bodies fill the
@@ -200,8 +200,8 @@ fn a_big_restore_stays_under_its_rss_ceiling() {
     const CHAIN_BIG: usize = 64;
     const MESSAGE_BYTES: usize = 200 * 1024;
     const CEILING_KB: u64 = 4 * 1024;
-    if std::env::var_os("SCION_RESTORE_BIG").is_none() {
-        println!("skipping the big restore: SCION_RESTORE_BIG arms it");
+    if std::env::var_os("SCION_TEST_RESTORE_BIG").is_none() {
+        println!("skipping the big restore: SCION_TEST_RESTORE_BIG arms it");
         return;
     }
 

@@ -404,16 +404,29 @@ jobs:
       - name: the streamed restore stays under its ceiling
         run: cargo test --release -p open-scion-server --test archive_restore_stream a_big_restore -- --nocapture
         env:
-          SCION_RESTORE_BIG: "1"
+          SCION_TEST_RESTORE_BIG: "1"
       - name: the whole-file read would not (the guard is not vacuous)
+        # The mutated run must fail for THE CEILING's reason, not any
+        # reason: a compile error or a missing /proc would "fail" the
+        # same way and prove nothing. The output must carry the
+        # ceiling assert's own text - the mutated run measured a peak,
+        # and the peak passed the bound. Any other failure shows the
+        # output and fails the step.
         run: |
-          if cargo test --release -p open-scion-server --test archive_restore_stream a_big_restore -- --nocapture; then
+          if out=$(cargo test --release -p open-scion-server --test archive_restore_stream a_big_restore -- --nocapture 2>&1); then
+            echo "$out"
             echo "::error::the whole-file mutation passed the ceiling: the guard is vacuous"
             exit 1
           fi
+          if ! printf '%s' "$out" | grep -q "passed the ceiling"; then
+            echo "$out"
+            echo "::error::the mutated run failed for a reason the ceiling did not name; the guard proves nothing"
+            exit 1
+          fi
+          printf '%s\n' "$out" | tail -5
           echo "the whole-file mutation blew the ceiling, as it must"
         env:
-          SCION_RESTORE_BIG: "1"
+          SCION_TEST_RESTORE_BIG: "1"
           SCION_TEST_RESTORE_MUTATION: "whole_file"
 
   # The Postgres majors the support matrix claims (docs/support.md):
