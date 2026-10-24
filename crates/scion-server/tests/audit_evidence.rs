@@ -93,7 +93,8 @@ fn tamper_history(store: &Backend, data: &std::path::Path, rows: &[(Vec<u8>, Vec
     if Backend::test_is_postgres() {
         let schema = Backend::test_schema(data).expect("postgres tests name a schema");
         let url = std::env::var("SCION_TEST_POSTGRES_URL").expect("the test database's URL");
-        let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("the test database connects");
+        let mut client =
+            postgres::Client::connect(&url, postgres::NoTls).expect("the test database connects");
         for (id, body) in &swapped {
             client
                 .execute(
@@ -157,7 +158,11 @@ fn fsck_reports_a_tampered_history_node() {
     eprintln!(
         "fsck probe: rows {} bodies-changed {}",
         after.len(),
-        after.iter().zip(&before).filter(|((_, a), (_, b))| a != b).count()
+        after
+            .iter()
+            .zip(&before)
+            .filter(|((_, a), (_, b))| a != b)
+            .count()
     );
 
     let problems = scion_server::fsck::run(&store, scion_server::fsck::BATCH, &mut |_| {})
