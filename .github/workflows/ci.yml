@@ -367,7 +367,7 @@ jobs:
         run: |
           # TEMPORARY evidence step: print both orders' lines, judge
           # nothing. The next commit pins the ceiling between them and
-          # restores the strict red step.
+          # restores the strict red step (SCION_LISTDIR_ENFORCE=1).
           cargo test -p open-scion-server --test listdir_rss -- --nocapture \
             > /tmp/listdir-green.log 2>&1 || true
           SCION_TEST_LISTDIR_MUTATION=build_then_share \
