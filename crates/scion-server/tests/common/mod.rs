@@ -129,11 +129,16 @@ impl Server {
             if let Some(status) = server.child.try_wait().unwrap() {
                 let text = fs::read_to_string(log).unwrap_or_default();
                 let fresh = text.get(mark..).unwrap_or_default();
-                let shown = if fresh.trim().is_empty() {
+                let body = if fresh.trim().is_empty() {
                     text.as_str()
                 } else {
                     fresh
                 };
+                // The CI log truncates a long line, and the tail is where
+                // an exit's reason sits: show at most its last 40 lines.
+                let lines: Vec<&str> = body.lines().collect();
+                let skip = lines.len().saturating_sub(40);
+                let shown = lines[skip..].join("\n");
                 panic!("the server exited with {status}:\n{shown}");
             }
             assert!(start.elapsed() < Duration::from_secs(60), "no listen");
@@ -188,11 +193,16 @@ impl Server {
             if let Some(status) = server.child.try_wait().unwrap() {
                 let text = fs::read_to_string(log).unwrap_or_default();
                 let fresh = text.get(mark..).unwrap_or_default();
-                let shown = if fresh.trim().is_empty() {
+                let body = if fresh.trim().is_empty() {
                     text.as_str()
                 } else {
                     fresh
                 };
+                // The CI log truncates a long line, and the tail is where
+                // an exit's reason sits: show at most its last 40 lines.
+                let lines: Vec<&str> = body.lines().collect();
+                let skip = lines.len().saturating_sub(40);
+                let shown = lines[skip..].join("\n");
                 panic!("the server exited with {status}:\n{shown}");
             }
             assert!(start.elapsed() < Duration::from_secs(60), "no listen");
@@ -284,11 +294,16 @@ impl Server {
             if let Some(status) = server.child.try_wait().unwrap() {
                 let text = fs::read_to_string(log).unwrap_or_default();
                 let fresh = text.get(mark..).unwrap_or_default();
-                let shown = if fresh.trim().is_empty() {
+                let body = if fresh.trim().is_empty() {
                     text.as_str()
                 } else {
                     fresh
                 };
+                // The CI log truncates a long line, and the tail is where
+                // an exit's reason sits: show at most its last 40 lines.
+                let lines: Vec<&str> = body.lines().collect();
+                let skip = lines.len().saturating_sub(40);
+                let shown = lines[skip..].join("\n");
                 panic!("the server exited with {status}:\n{shown}");
             }
             assert!(start.elapsed() < Duration::from_secs(60), "no listen");
