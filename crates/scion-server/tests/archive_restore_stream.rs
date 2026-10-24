@@ -255,40 +255,39 @@ fn a_big_restore_stays_under_its_rss_ceiling() {
     // A restore runs as its own process, so the peak RSS measured is
     // the restore's, not the test fixture's. The twin first: an empty
     // archive, restored the same way - its peak is the binary's own
-    // footprint on this machine, and the bound rides on it.
+    // footprint on this machine, and the bound rides on it. The
+    // ceiling runs where the CI job runs it: Linux.
+    #[cfg(target_os = "linux")]
+    measure_ceiling(&store, &out, SLACK_KB);
+    #[cfg(not(target_os = "linux"))]
+    println!("the ceiling measures wait4 peaks on Linux only; skipping here");
+}
+
+/// The ceiling's own measure and verdict: the twin's baseline, the big
+/// restore's peak under baseline + slack, the restored store answering
+/// like the source, and the fsck that says so.
+#[cfg(target_os = "linux")]
+fn measure_ceiling(store: &Backend, out: &std::path::Path, slack_kb: u64) {
     let baseline_kb = restore_sampled(
         &empty_archive(),
         &tempfile::tempdir().unwrap().path().join("restored-empty"),
     );
-    // The twin's process is short; a sampler that lost the race answers
-    // a startup page count, not a footprint, and the bound under it
-    // would refuse every honest restore. A real Rust binary with a
-    // runtime holds megabytes.
-    assert!(
-        baseline_kb >= 8 * 1024,
-        "the twin's baseline sampled {baseline_kb} kB - the sampler lost \
-         the process before it grew; this test needs /proc (Linux)"
-    );
     let target = tempfile::tempdir().unwrap().path().join("restored");
-    let peak_kb = restore_sampled(&out, &target);
+    let peak_kb = restore_sampled(out, &target);
     println!(
         "the streamed restore's peak RSS was {peak_kb} kB; \
-         the bound is the twin's baseline {baseline_kb} kB + the replay's slack {SLACK_KB} kB"
+         the bound is the twin's baseline {baseline_kb} kB + the replay's slack {slack_kb} kB"
     );
     assert!(
-        peak_kb > 0,
-        "the sampler saw no peak; this test needs /proc (Linux)"
-    );
-    assert!(
-        peak_kb <= baseline_kb + SLACK_KB,
+        peak_kb <= baseline_kb + slack_kb,
         "the restore's peak RSS ({peak_kb} kB) passed the ceiling \
-         (baseline {baseline_kb} kB + slack {SLACK_KB} kB); \
+         (baseline {baseline_kb} kB + slack {slack_kb} kB); \
          a whole-history read is back"
     );
 
     // The restored store answers like the source.
     let restored = Backend::open(&target, None, None).unwrap();
-    assert_restore_equals_source(&store, &restored);
+    assert_restore_equals_source(store, &restored);
     let problems = fsck::run(&restored, fsck::BATCH, &mut |_| {}).unwrap();
     assert!(problems.problems.is_empty(), "{problems:?}");
 }
@@ -360,6 +359,7 @@ fn a_killed_restore_leaves_the_next_one_clean() {
 
 /// An archive of a store with no repos: the twin the ceiling test
 /// restores to measure the binary's own footprint.
+#[cfg(target_os = "linux")]
 fn empty_archive() -> std::path::PathBuf {
     let data = tempfile::tempdir().unwrap();
     let store = Backend::open_test(data.path()).unwrap();
@@ -378,12 +378,16 @@ fn empty_archive() -> std::path::PathBuf {
     out
 }
 
-/// A restore in its own process, with its peak RSS sampled from
-/// `/proc`: `VmHWM` is the process's high-water mark in kB, the mark
-/// never falls, and the sampler keeps the last value it saw.
+/// A restore in its own process, whose exact peak RSS the kernel
+/// hands back with the reaped child: wait4's rusage, `ru_maxrss` in
+/// KiB on Linux. No sampling, no race - a short process's peak is as
+/// exact as a long one's.
+#[cfg(target_os = "linux")]
 fn restore_sampled(archive: &std::path::Path, target: &std::path::Path) -> u64 {
+    use std::io::Read as _;
+
     std::fs::create_dir_all(target).unwrap();
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
         .arg("--data")
         .arg(target)
         .arg("restore")
@@ -393,31 +397,38 @@ fn restore_sampled(archive: &std::path::Path, target: &std::path::Path) -> u64 {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let pid = child.id();
-    let sampler = std::thread::spawn(move || {
-        let status = format!("/proc/{pid}/status");
-        let mut last = 0_u64;
-        // VmHWM is the kernel's high-water mark: any read while the
-        // process lives answers the max so far, so the only race is
-        // the process dying between reads - poll fast.
-        while let Ok(text) = std::fs::read_to_string(&status) {
-            for line in text.lines() {
-                if let Some(kb) = line.strip_prefix("VmHWM:")
-                    && let Ok(kb) = kb.trim().trim_end_matches("kB").trim().parse::<u64>()
-                {
-                    last = last.max(kb);
-                }
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        last
+    // The pipes are drained while wait4 holds the reap, so a chatty
+    // child cannot wedge on a full pipe: the child's stderr is the
+    // failure text this function reports.
+    let mut stderr = child.stderr.take().unwrap();
+    let stderr_pipe = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
     });
-    let output = child.wait_with_output().unwrap();
-    let peak = sampler.join().unwrap();
-    assert!(
-        output.status.success(),
-        "the restore failed:\n{}",
-        String::from_utf8_lossy(&output.stderr)
+    let mut stdout_pipe = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        let mut sink = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut sink);
+    });
+    let mut status = 0_i32;
+    let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
+    // The pid is ours to wait for; EINTR would leave the child
+    // unreaped, so retry it.
+    let wait = loop {
+        let got = unsafe { libc::wait4(child.id() as libc::pid_t, &mut status, 0, &mut rusage) };
+        if got >= 0 {
+            break got;
+        }
+    };
+    assert_eq!(
+        wait as u32,
+        child.id(),
+        "wait4 reaped another process's child"
     );
-    peak
+    let ok = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+    let stderr = stderr_pipe.join().unwrap();
+    assert!(ok, "the restore failed:\n{stderr}");
+    // Linux answers ru_maxrss in KiB.
+    rusage.ru_maxrss as u64
 }
