@@ -514,7 +514,15 @@ walk refused. Metrics are for the operator, not for the readers.
 The server and the cache refuse a non-loopback address unless they serve TLS
 (`--tls-cert` and `--tls-key`) or get `--insecure-listen`. A client trusts a
 private CA: `scn --tls-ca ca.pem`, a tier for its upstream with its own
-`--tls-ca`. Between tiers, either end can demand a client certificate
+`--tls-ca`. A tier that names an https upstream but gives no `--tls-ca`
+refuses to start. A tier whose `--tls-ca` did not sign the upstream's
+certificate starts, and fails at its first object fetch: the reply answers
+`unavailable` ('received corrupt message of type InvalidContentType') and
+the tier's log carries
+`WARN scion_tier: fetch from upstream failed ... InvalidContentType` - a
+cache must start while its upstream is briefly down, so the certificate is
+checked by the first call, not at start. Between tiers, either end can
+demand a client certificate
 (`--tls-client-ca` on the server or cache; `--tls-client-cert` and
 `--tls-client-key` on the cache or daemon). A bearer token over plain TCP to
 a non-loopback address stays refused.
