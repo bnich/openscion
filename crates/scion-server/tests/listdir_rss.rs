@@ -208,9 +208,12 @@ async fn held_list_dir_replies_stay_under_the_budget_in_rss() {
         clients.push(client);
     }
 
-    // Open every stream at once: the first builds take their shares
-    // and hold their bodies; the rest park on the spent budget until
-    // the open timeout. A parked call is the design, not a failure.
+    // Open every stream at once, and HOLD whatever opens: the first
+    // builds take their shares and hold their bodies; the rest park on
+    // the spent budget. A parked call is the design, not a failure.
+    // The holds stay live across the measurement: the measurement must
+    // see the bodies while the server holds them, not after the
+    // clients walked away and the bytes went free.
     let mut tasks = tokio::task::JoinSet::new();
     for i in 0..STREAMS {
         let changeset_bytes = changeset_bytes.clone();
@@ -218,32 +221,31 @@ async fn held_list_dir_replies_stay_under_the_budget_in_rss() {
         tasks.spawn(async move {
             let request = ListDirRequest {
                 repo: REPO.into(),
-                changeset_id: changeset_bytes.clone(),
+                changeset_id: changeset_bytes,
                 path: Vec::new(),
             };
-            let opened = tokio::time::timeout(OPEN_TIMEOUT, client.list_dir(request)).await;
-            if let Ok(Ok(response)) = opened {
-                let stream = response.into_inner();
-                // Hold the stream: its reply is never read. The
-                // hold outlives the measurement below; the timeout
-                // keeps a client that would wait forever moving.
-                let _ = tokio::time::timeout(OPEN_TIMEOUT, std::future::pending::<()>()).await;
-                drop(stream);
-                true
-            } else {
-                false
+            match tokio::time::timeout(OPEN_TIMEOUT, client.list_dir(request)).await {
+                Ok(Ok(response)) => {
+                    let stream = response.into_inner();
+                    // Hold the stream: its reply is never read, and
+                    // the hold never ends on its own.
+                    std::future::pending::<()>().await;
+                    drop(stream);
+                    true
+                }
+                _ => false,
             }
         });
     }
-    let opened = tasks.join_all().await;
-    let held = opened.iter().filter(|held| **held).count();
-    println!("{held} of {STREAMS} streams hold replies; the rest parked");
-
-    // Every opened call either built its body (budget-paid) or was
-    // refused; give the builds a moment to land, then measure.
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // The opens settle: the first builds land inside a second, the
+    // parked calls sit on the budget. Wait past the open timeout so
+    // every stream has opened or parked, then measure while the holds
+    // are live.
+    tokio::time::sleep(OPEN_TIMEOUT + std::time::Duration::from_secs(5)).await;
     let after_kb = rss_kb(server.child.id());
     assert!(after_kb > 0, "the server stays up and reports its RSS");
+    tasks.abort_all();
+    let _ = tasks.join_all().await;
     let budget_kb = (scion_server::READ_BUDGET_BYTES / 1024) as u64;
     let ceiling = baseline_kb + CEILING_BUDGETS * budget_kb + SLACK_KB;
     let floor = baseline_kb + budget_kb / 2;

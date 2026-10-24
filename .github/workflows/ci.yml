@@ -372,9 +372,9 @@ jobs:
           # The lever reverts to the old order (build first, share
           # after) and must blow the ceiling - and must blow it for the
           # RSS reason, not by crashing, so the step demands the words.
-          cargo test -p open-scion-server --test listdir_rss
+          cargo test -p open-scion-server --test listdir_rss -- --nocapture
           if SCION_TEST_LISTDIR_MUTATION=build_then_share \
-            cargo test -p open-scion-server --test listdir_rss \
+            cargo test -p open-scion-server --test listdir_rss -- --nocapture \
             > /tmp/listdir-red.log 2>&1; then
             echo "::error::the old build-then-share order passed the RSS bound"
             exit 1
