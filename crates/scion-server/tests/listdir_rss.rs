@@ -244,8 +244,9 @@ async fn held_list_dir_replies_stay_under_the_budget_in_rss() {
     tokio::time::sleep(OPEN_TIMEOUT + std::time::Duration::from_secs(5)).await;
     let after_kb = rss_kb(server.child.id());
     assert!(after_kb > 0, "the server stays up and reports its RSS");
-    tasks.abort_all();
-    let _ = tasks.join_all().await;
+    // The holds stay live through the asserts below; the JoinSet's
+    // drop (the test's end) aborts them. Joining after an abort panics
+    // on the cancelled tasks, so the set is only ever dropped.
     let budget_kb = (scion_server::READ_BUDGET_BYTES / 1024) as u64;
     let ceiling = baseline_kb + CEILING_BUDGETS * budget_kb + SLACK_KB;
     let floor = baseline_kb + budget_kb / 2;
