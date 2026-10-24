@@ -28,21 +28,21 @@ const REPO: &str = "main";
 const TOKEN: &str = "secret";
 
 /// One directory wide enough that one `ListDir` reply's tree body is
-/// about 2 MB (13,000 entries of 120 characters).
-const NAMES: usize = 13_000;
-/// Held unread streams: 360 bodies of about 2 MB is about 749 MB of
-/// live bytes under the old order, more than the whole ceiling
-/// (baseline + two budgets + slack), so the old order passes it by its
-/// live bytes alone - the red cannot ride on how the allocator treats
-/// freed copies. The right order caps live bodies at the budget
-/// (about 130), and its measured run (CI 40103512403) lands at 545 MB
-/// over baseline, under that ceiling.
-const STREAMS: usize = 360;
-/// The streams ride 18 connections: 20 replies of 2 MB is about 42 MB
+/// about 20 MB (130,000 entries of 120 characters): bodies big enough
+/// that the budget's live bytes dominate the per-stream overhead of
+/// HTTP/2 and the channels, so the two orders separate cleanly.
+const NAMES: usize = 130_000;
+/// Held unread streams: 40 bodies of about 20 MB is about 832 MB of
+/// live bytes under the old order - more than twice the ceiling - so
+/// the old order passes it by its live bytes alone, and the red cannot
+/// ride on how the allocator treats freed copies. The right order caps
+/// live bodies at the read budget: about 12 bodies.
+const STREAMS: usize = 40;
+/// The streams ride 20 connections: 2 replies of 20 MB is about 42 MB
 /// per connection, under the 64 MiB stalled-bytes cap that would
 /// otherwise close a connection and free what it holds - the test must
 /// measure the read budget, not the stall cap.
-const CONNECTIONS: usize = 18;
+const CONNECTIONS: usize = 20;
 /// The ceiling is baseline + TWO read budgets + slack: one budget is
 /// the held bodies' own bytes, the second is the transient copy each
 /// build makes while it encodes (the allocator keeps freed 2 MB blocks
