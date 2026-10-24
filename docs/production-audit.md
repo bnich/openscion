@@ -42,11 +42,11 @@ document landed on.
 | Finding | Evidence | Status |
 | --- | --- | --- |
 | Protocol reads are length-capped before `read_to_end` | `crates/scion-proto/src/runtime/auth/mod.rs:352`, cap `MAX_CHECKED_FILE = 1 MiB` at `:278` | bounded — ceiling: 1 MiB per checked read, `cap + 1` then refused; `docs/protocol-v1.md` states the message size limits |
-| One unary reply can aggregate a whole directory or changeset past the per-object memory budget (`whole_share` charges by encoded size, the aggregate is uncapped) | `crates/scion-server/src/service.rs:485,935` | open |
-| Slow clients can pin large unary replies outside the memory accounting | `crates/scion-server/src/service.rs` (`into_server`) | open |
+| One unary reply can aggregate a whole directory or changeset past the per-object memory budget (`whole_share` charged by encoded size, the aggregate uncapped) | `crates/scion-server/src/service.rs:485` (`whole_share_of`), `:1822` (the changeset's length-only query), `:1986` (`tree_size`) | fixed (#586): the share is taken from a length-only query before the object is built, an object over `MAX_OBJECT_BYTES` is refused before any byte is read, and the share is held for the whole reply (`stream_whole_holding`); the guard is `tests/reply_budget_h2.rs` (`a_client_that_resets_its_unread_replies_frees_the_budget`, which asserts the budget binds at `bodies.len() < 40` and the served reply is whole) |
+| Slow clients can pin large unary replies outside the memory accounting | `crates/scion-server/src/reply.rs` (`REPLY_MEMORY_BUDGET`), `crates/scion-server/src/metrics.rs` (`CountingBody`) | fixed (#586): the reply-memory layer counts every in-flight reply's bytes and refuses new unary replies past the 128 MiB budget; a client that resets its unread replies frees the budget (the guard is the same `tests/reply_budget_h2.rs` test) |
 | `gc` prune reads and deletes in batches of 1,000 rows | `crates/scion-server/src/gc.rs` (`prune_rows`) | fixed (#529 batched the reads and the deletes; the guard is `tests/gc_prune_batch.rs`) |
-| `scn commit` reads a regular file whole into RAM: the size limit is "whatever fits" | `crates/scn/src/cmd/commit.rs` | open |
-| `scn` JSON output silently replaces non-UTF-8 bytes | `crates/scn/src/client.rs:326` | open |
+| `scn commit` reads a regular file whole into RAM: the size limit is "whatever fits" | `crates/scn/src/cmd/commit.rs` | fixed (#582 streams from the file in 1 MiB chunks; the ceiling is the RSS guard, `crates/scn/tests/commit_stream.rs`, 24 MiB file under a 32 MiB ceiling) |
+| `scn` JSON output silently replaces non-UTF-8 bytes | `crates/scn/src/client.rs:328` (`lossy`), `:336` (`put_json_bytes`) | fixed (#576): the lossy text stays, and every non-UTF-8 name or message carries the exact bytes in a sibling `<field>_b64` (standard base64) so scripts can round-trip them; the guard is `crates/scn/tests/json_raw_bytes.rs` (`assert_b64` and the seed suites) |
 | Import batches are time-based per transaction and count-based for blobs | `crates/scion-server/src/import.rs:52` (`TX_BUDGET = 1 s`), `store.rs` (`BlobBatch`) | bounded — ceiling: 1 s of work or one commit per import transaction; `docs/benchmarks.md` records the measured commit size and rate the batches were tuned at |
 
 ## 4. Database loops
@@ -179,7 +179,7 @@ in-process; stated in the PR).
 
 | Finding | Evidence | Status |
 | --- | --- | --- |
-| The default data directory is `scion-data` relative to the server's working directory, and the server creates it | `crates/scion-server/src/main.rs:29` | bounded — ceiling: the created directory is the one flag-named (or cwd-relative default) path, 0700 by the process umask; `docs/cli.md` documents the flag and the default. The open question — create vs refuse — is tracked open |
+| The default data directory is `scion-data` relative to the server's working directory | `crates/scion-server/src/main.rs:29` | fixed (D25): a missing data directory is refused, not created — every subcommand except restore answers "<path> does not exist; create it or pass --data" (`main.rs`, `refuse_missing_data_dir`); fsck's refusal exits 2, its "could not run" code; `tests/refuse_data_dir.rs` holds every subcommand to the refusal and asserts nothing is created |
 | Secrets on argv: `--postgres-url` is deprecated and warns; `--postgres-url-file` and `SCION_POSTGRES_URL` are the supported forms | `crates/scion-server/src/main.rs:33-43` | fixed (the warning ships; the removal is on the deprecation clock) |
 | Ticket and seed files are 0600; the access file refuses group/other writable and symlinks | `crates/scion-server/src/main.rs:1333,1433,1493` | bounded — ceiling: 0600 on every secret file, the access file refuses go-w and symlinks at the open; `operations.md` "The open checks" states the refusal |
 | Listeners default to loopback | `crates/scion-server/src/main.rs:59` (`default_value = "127.0.0.1:7878"`) | bounded — ceiling: the default bind is 127.0.0.1:7878; `docs/operations.md`'s serve examples restate it |
@@ -189,7 +189,26 @@ in-process; stated in the PR).
 
 | Finding | Evidence | Status |
 | --- | --- | --- |
-| The store format, the protocol and the archive format are versioned documents; the unknown-field policy is stated per format | `docs/format-v1.md`, `docs/protocol-v1.md`, `docs/archive-format.md`, `docs/compatibility.md` | fixed by design (the policy is the compatibility doc) — the additive contract goldens that enforce it are open |
+| The store format, the protocol and the archive format are versioned documents; the unknown-field policy is stated per format, and each format's goldens enforce it | `docs/format-v1.md`, `docs/protocol-v1.md`, `docs/archive-format.md`, `docs/compatibility.md` | fixed — the table below |
+
+### The contract goldens
+
+| Format | The golden | The additive rule the test enforces | The doc pairing |
+| --- | --- | --- | --- |
+| Store (`docs/format-v1.md`) | `crates/scion-core/tests/golden.rs`: expected bytes hand-assembled from the grammar, independent of the encoder | an unknown tag, version, flag or git-algo byte is refused with the named error (`rejects_bad_tags_flags_and_algos`); red-proven: a decoder that accepts unknown tags fails it | the lint watches `golden.rs`: a change without a version-line move fails |
+| Protocol (`docs/protocol-v1.md`) | `crates/scion-proto/tests/wire_golden.rs` + `protocol_wire_v1.golden`: the wire bytes of three fixed messages, hand-assembled from the proto3 grammar; the encoder must write exactly them and the golden must read back to the same values | unknown fields (varint 999, length-delimited 998) appended to every golden message decode with the known values unchanged (the doc's MUST-ignore); red-proven: one flipped golden byte fails the encoder test | the lint watches `protocol_wire_v1.golden`, `protocol_surface_v1.golden` and `proto/scion.proto` |
+| Archive (`docs/archive-format.md`) | `crates/scion-server/tests/archive_golden.rs` + `archive_v1.golden`: one export's files and normalized manifest, byte-for-byte, on both backends | a manifest with an unknown version or format is refused with the named error before any write (`an_archive_of_an_unknown_version_or_format_is_refused`); red-proven: a reader that accepts version 2 restores the archive and fails the test | the lint watches `archive_v1.golden` and `archive_golden.rs` |
+
+The pairing is enforced on the diff: `scripts/check-golden-pairing.sh`
+(the CI lint job, on the pull request's own `HEAD^1..HEAD`). Pinned
+bytes (the wire golden, the store pins, the archive golden) fail
+without their format document's version line in the same pull request.
+`proto/scion.proto` and the surface golden are additive - they need no
+new version (the doc's additive table) - so they need only the same
+pull request changing `docs/protocol-v1.md`, any line: the contract
+must describe the new surface. A golden file the pull request adds is
+its initial pin: the in-tree tests hold that first pin against the
+doc, and the lint holds every later change.
 | Migrations carry no rollback path; the evidence is forward-only: N-1 opens N's store, N refuses a newer database, and the failed-migration runbook restores from backup | `crates/scion-server/tests/schema_drift.rs`, `scripts/version-matrix.sh:10-13`, `docs/operations.md` "A failed migration" | fixed by design (forward-only, with the matrix and the runbook as the evidence) |
 | Fixtures of the current build only: the version matrix runs the pinned N-1 binaries against the current store both directions | `scripts/version-matrix.sh` | fixed (#540-era legs; the matrix never passes as a skip) |
 | Backups and the failed-migration runbook are tested against a live server, not hand-written fixtures | `crates/scion-server/tests/backup.rs`, `crash.rs:342` | fixed |
@@ -223,11 +242,9 @@ section; its fixes landed as #561. Highlights, with the C50 verdicts:
    open, closed by C54 (§1).
 2. The archive restore's repository-sized RAM hold (§2), and the C60
    Postgres lock-restart runbook + whether `serve` should wait (§2).
-3. The unary reply caps: `whole_share` aggregates and slow-client
-   pinning (§3), `scn commit` whole-file reads (§3), `lossy` JSON (§3).
+3. The unary reply caps and `lossy` JSON closed (#586, #576); the
+   `scn commit` whole-file read closed by #582 (§3).
 4. The database-loop sweep: SQL in loops, `ORDER BY`, isolation (§4).
-5. The panic fixes the inventory (§5a) leaves: the worker-spawn
-   `EAGAIN` path, and the flight-leak fix's PR (§5b).
 6. The data-dir default create-vs-refuse question (§6).
 7. The additive contract goldens that enforce the format policies (§7).
 8. Digest pins for the service-container tags (§9).
