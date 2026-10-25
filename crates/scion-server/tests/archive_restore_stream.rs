@@ -433,7 +433,7 @@ fn restore_sampled(archive: &std::path::Path, target: &std::path::Path, tx_bytes
 
 /// The truncation lands LATE in the stream: the first batch is already
 /// committed when the reader walks into the cut. The design (archive.rs,
-/// restore_impl): every batch lands in a staging directory beside the
+/// `restore_impl`): every batch lands in a staging directory beside the
 /// target, and the target receives the store by ONE rename only after
 /// the whole replay. A late truncation must therefore fail the restore
 /// and leave the target with NO store a server would open - the answer
