@@ -109,6 +109,26 @@ impl Server {
     }
 }
 
+/// The failed start's report: the lines the server itself wrote (the log
+/// after `mark`), bounded to the tail - the CI log truncates a long line,
+/// and an exit's reason sits at the tail. A server that wrote nothing at
+/// all reports the whole log.
+fn exit_report(log: &Path, mark: usize, status: std::process::ExitStatus) -> String {
+    let text = fs::read_to_string(log).unwrap_or_default();
+    let fresh = text.get(mark..).unwrap_or_default();
+    let body = if fresh.trim().is_empty() {
+        text.as_str()
+    } else {
+        fresh
+    };
+    let lines: Vec<&str> = body.lines().collect();
+    let skip = lines.len().saturating_sub(40);
+    format!(
+        "the server exited with {status}:\n{}",
+        lines[skip..].join("\n")
+    )
+}
+
 impl Server {
     /// Starts a server on `data` and waits until it listens. It appends its
     /// log to `log`. In Postgres mode (`SCION_TEST_BACKEND=postgres`) it
@@ -127,19 +147,7 @@ impl Server {
         let start = Instant::now();
         while !server.listens(log) {
             if let Some(status) = server.child.try_wait().unwrap() {
-                let text = fs::read_to_string(log).unwrap_or_default();
-                let fresh = text.get(mark..).unwrap_or_default();
-                let body = if fresh.trim().is_empty() {
-                    text.as_str()
-                } else {
-                    fresh
-                };
-                // The CI log truncates a long line, and the tail is where
-                // an exit's reason sits: show at most its last 40 lines.
-                let lines: Vec<&str> = body.lines().collect();
-                let skip = lines.len().saturating_sub(40);
-                let shown = lines[skip..].join("\n");
-                panic!("the server exited with {status}:\n{shown}");
+                panic!("{}", exit_report(log, mark, status));
             }
             assert!(start.elapsed() < Duration::from_secs(60), "no listen");
             std::thread::sleep(Duration::from_millis(10));
@@ -191,19 +199,7 @@ impl Server {
         let start = Instant::now();
         while !server.listens(log) {
             if let Some(status) = server.child.try_wait().unwrap() {
-                let text = fs::read_to_string(log).unwrap_or_default();
-                let fresh = text.get(mark..).unwrap_or_default();
-                let body = if fresh.trim().is_empty() {
-                    text.as_str()
-                } else {
-                    fresh
-                };
-                // The CI log truncates a long line, and the tail is where
-                // an exit's reason sits: show at most its last 40 lines.
-                let lines: Vec<&str> = body.lines().collect();
-                let skip = lines.len().saturating_sub(40);
-                let shown = lines[skip..].join("\n");
-                panic!("the server exited with {status}:\n{shown}");
+                panic!("{}", exit_report(log, mark, status));
             }
             assert!(start.elapsed() < Duration::from_secs(60), "no listen");
             std::thread::sleep(Duration::from_millis(10));
@@ -292,19 +288,7 @@ impl Server {
         let start = Instant::now();
         while !server.listens(log) {
             if let Some(status) = server.child.try_wait().unwrap() {
-                let text = fs::read_to_string(log).unwrap_or_default();
-                let fresh = text.get(mark..).unwrap_or_default();
-                let body = if fresh.trim().is_empty() {
-                    text.as_str()
-                } else {
-                    fresh
-                };
-                // The CI log truncates a long line, and the tail is where
-                // an exit's reason sits: show at most its last 40 lines.
-                let lines: Vec<&str> = body.lines().collect();
-                let skip = lines.len().saturating_sub(40);
-                let shown = lines[skip..].join("\n");
-                panic!("the server exited with {status}:\n{shown}");
+                panic!("{}", exit_report(log, mark, status));
             }
             assert!(start.elapsed() < Duration::from_secs(60), "no listen");
             std::thread::sleep(Duration::from_millis(10));
