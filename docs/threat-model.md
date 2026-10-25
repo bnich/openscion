@@ -279,6 +279,13 @@ that breaks one is caught.
   per-principal request and upload caps begin once the token names a
   principal.
   `scion-server/tests/every_rpc_unauthenticated.rs::every_rpc_answers_unauthenticated_without_a_valid_token`
+- **A cache verifies every ticket it serves.** The cache refuses to
+  start without a public key, and a call whose ticket the key did not
+  sign is refused before the walk; the unverified relay is the daemon's
+  explicit mode (its 0600 socket already gives it one user). The
+  connection cap, the stream cap and the audit meter's per-address
+  folding bound a refused call the same as any other.
+  `scion-tier/tests/keyless_cache.rs::a_cache_without_a_public_key_does_not_start`
 - **A refused-auth flood is counted by the machine, not the socket.**
   The audit meter folds one peer's refusals into counted lines keyed
   by the address — an IPv6 by its /64, the smallest block one site

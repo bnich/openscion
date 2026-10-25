@@ -215,7 +215,7 @@ client's `--token` is what it sends, the other side of the pair of the tier
 in front of it.
 
 ```sh
-SCION_TOKEN=<CACHE_TOKEN> SCION_UPSTREAM_TOKEN=<SERVER_TOKEN> \
+SCION_TOKEN=<SERVER_TOKEN> SCION_UPSTREAM_TOKEN=<SERVER_TOKEN> \
   ./scion-cache --upstream http://SERVER:7878 \
   --ticket-public-key <PUBLIC_KEY_HEX>
 ```
@@ -224,16 +224,28 @@ The cache keeps its objects in memory and drops the least recently used
 first: `--max-bytes` (1 GiB) is the most object bytes it holds. A snapshot
 holds at most `--snapshot-bytes` object bytes (256 MiB).
 
-The cache needs `--ticket-public-key` (the hex that `ticket-key` printed):
-without it, it serves no objects. A `scn` user then points reads at the
-cache with `scn checkout --server http://SERVER:7878 --objects http://CACHE:7879`.
+The cache needs `--ticket-public-key` (the hex that `ticket-key` printed),
+and refuses to start without one: a cache that checked no ticket would
+serve every object it holds to any caller that names an object ID. A
+`scn` user then points reads at the cache with
+`scn checkout --server http://SERVER:7878 --objects http://CACHE:7879`.
+
+One token rule the flag list hides (section 2 says it for the daemon
+chain): `scn` sends its one `--token` on every call, to the server and to
+the cache, so the token the user holds must be accepted by both. The
+example gives the cache the same caller token the server holds.
 
 ### Server, cache, and a daemon per user
 
 ```sh
+mkdir -p ~/.scion-daemon
 SCION_TOKEN=<USER_TOKEN> SCION_UPSTREAM_TOKEN=<CACHE_TOKEN> \
   ./scion-daemon --data ~/.scion-daemon --upstream http://CACHE:7879
 ```
+
+The daemon refuses a data directory that does not exist, like the
+server does: a typo must not make a new empty store and serve from
+it.
 
 The daemon's data directory must be private to its user (mode 0700, not a
 shared path such as `/tmp`); it serves on a 0600 Unix socket in it
@@ -274,8 +286,17 @@ line is readable by every local account (`ps`), an environment value
 by the same user and root, and a file with the checks of the access
 file by whoever can read it.
 
+The database must hold the schema before the first serve: an open whose
+`search_path` names a schema that does not exist is refused (`the URL's
+search_path names no existing schema; create it first`). Make it once,
+before the first start:
+
 ```sh
-printf 'postgres://user@dbhost/scion?sslmode=require\n' > /srv/scion/db-url
+psql 'postgres://user@dbhost/scion?sslmode=require' -c 'CREATE SCHEMA scion'
+```
+
+```sh
+printf 'postgres://user@dbhost/scion?sslmode=require&options=--search_path%3Dscion\n' > /srv/scion/db-url
 chmod 600 /srv/scion/db-url
 scion-server --data /srv/scion \
   --postgres-url-file /srv/scion/db-url \
@@ -318,7 +339,10 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
   server's own 9, the operator's tooling beside it (`pg_dump`, `psql`,
   a metrics scraper), and a margin. A database at its connection cap
   refuses the server's next connection, and every call that needs one
-  answers `unavailable` until one is free.
+  answers `unavailable` until one is free. While the writer is idle, its
+  connection pings the database with one autocommit `SELECT 1` a minute:
+  a lost connection or a lost fence surfaces on the probe instead of
+  hanging the next write.
 - The one-server rule and the write queue are Postgres advisory locks,
   visible as `pg_locks` rows of kind `advisory`: the one-server lock is
   a key of the schema `current_schema()` names, the migration lock is a
@@ -359,7 +383,7 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
   client calls: the check runs on the server's own session, through the
   same queue as every statement, never on a second connection.
 - A start after an unclean kill can refuse its open with "another
-  server holds this database": the dead server's session is still in
+  server holds this store" (the refusal's exact text): the dead server's session is still in
   the database, and the one-server lock dies only when Postgres ends
   that session. On the same host that is at once - the kernel closes a
   dead process's sockets - so the service manager's restart
@@ -376,9 +400,30 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
 - The SQLite store has none of this: one file is opened by one process at
   the kernel level, so there is no lock to lose and no fence. The notes
   above that name the one-server lock and the fence are Postgres only.
+- Re-pairing a lost marker: if an open refuses with "this database names
+  the store ..., but the data directory carries no marker of it" and the
+  directory IS the one this database was served with — its blob files
+  are there — the `backend` marker file was lost and can be written
+  back. The marker is two lines: `postgres`, then the 32 hex digits the
+  error text names (lowercase, no dashes). Write it exactly:
+
+  ```sh
+  printf 'postgres\n<uuid-from-the-error>\n' > /srv/scion/backend
+  ```
+
+  then start the server. Do NOT do this for a directory the database
+  was never served with: its blob files are missing, and the correct
+  move is a different directory (`--data`), not a marker. A UUID line
+  that is not 32 hex digits counts as no UUID at all - the open refuses
+  again with the same "carries no marker" message - so check what you
+  wrote (for example `od -c /srv/scion/backend`) before you conclude
+  the re-pairing failed.
 
 Backup and restore of a Postgres-backed server: `pg_dump` the database
-first, then copy the data directory. A changeset in the dump names only
+first, then copy the data directory. One database can hold several stores,
+each in its own schema; a dump of the database backs up every store in it,
+and one store alone is `pg_dump --schema <name>` (its restore reads back
+into the schema of the same name). A changeset in the dump names only
 blob files that existed when the dump was taken, and a blob file is written
 before its database row commits, so the later copy holds every file the
 dump names. Restore into a fresh database, copy the data directory back,
@@ -388,11 +433,16 @@ start the server with the same `--postgres-url`.
 
 `--token` and `--access` are exclusive. An access file names tokens by their
 BLAKE3 digest (never the token itself) and maps each to a principal with
-per-repo read and write rules:
+per-repo read and write rules. Every line is tab-separated, and the columns
+are: the line's kind (`token`, `read`, `write`), the principal, then what
+the line grants - a digest on a `token` line, a repo name on a `read` or
+`write` line. A `read` or `write` line may carry one more column, a path
+prefix that limits the rule to that folder (`read\tops\tmain\tsrc/a`
+covers `src/a/...`, not `srcx`); without it the line covers the whole repo:
 
 ```sh
 TOK=$(printf %s <SECRET> | ./scion-server hash-token)
-printf 'token\tops\t%s\nread\tops\tr\nwrite\tops\tr\n' "$TOK" > /srv/scion/access.txt
+printf 'token\tops\t%s\nread\tops\tmain\nwrite\tops\tmain\n' "$TOK" > /srv/scion/access.txt
 chmod 600 /srv/scion/access.txt
 ./scion-server --data /srv/scion serve --access /srv/scion/access.txt \
   --ticket-key /srv/scion-keys/ticket.key
@@ -500,7 +550,15 @@ walk refused. Metrics are for the operator, not for the readers.
 The server and the cache refuse a non-loopback address unless they serve TLS
 (`--tls-cert` and `--tls-key`) or get `--insecure-listen`. A client trusts a
 private CA: `scn --tls-ca ca.pem`, a tier for its upstream with its own
-`--tls-ca`. Between tiers, either end can demand a client certificate
+`--tls-ca`. A tier that names an https upstream but gives no `--tls-ca`
+refuses to start. A tier whose `--tls-ca` did not sign the upstream's
+certificate starts, and fails at its first object fetch: the reply answers
+`unavailable` ('received corrupt message of type InvalidContentType') and
+the tier's log carries
+`WARN scion_tier: fetch from upstream failed ... InvalidContentType` - a
+cache must start while its upstream is briefly down, so the certificate is
+checked by the first call, not at start. Between tiers, either end can
+demand a client certificate
 (`--tls-client-ca` on the server or cache; `--tls-client-cert` and
 `--tls-client-key` on the cache or daemon). A bearer token over plain TCP to
 a non-loopback address stays refused.
