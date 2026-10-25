@@ -114,6 +114,7 @@ impl Tiers {
                 land_stale_secs: 1 << 40,
                 tls: None,
                 metrics: Arc::default(),
+                reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
             },
             Some(std::sync::Arc::new(tickets)),
             pending(),
@@ -139,15 +140,8 @@ impl Tiers {
 
         let node = tempfile::tempdir().unwrap();
         let store_dir = DiskStore::open(&node.path().join("data"), 64 << 20).unwrap();
-        let daemon = Tier::new(
-            store_dir,
-            &cache_url,
-            TOKEN,
-            DAEMON_UPSTREAM_TIMEOUT,
-            None,
-            Vec::new(),
-        )
-        .unwrap();
+        let daemon =
+            Tier::new_relay(store_dir, &cache_url, TOKEN, DAEMON_UPSTREAM_TIMEOUT, None).unwrap();
         // The socket's directory must be private.
         fs::set_permissions(node.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let path = node.path().join("daemon.sock");
