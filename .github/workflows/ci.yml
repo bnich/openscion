@@ -426,7 +426,7 @@ jobs:
             echo "::error::the mutated run failed for a reason the ceiling did not name; the guard proves nothing"
             exit 1
           fi
-          printf '%s\n' "$out" | tail -5
+          printf '%s\n' "$out" | grep -oE "peak RSS \([0-9]+ kB\) passed the ceiling" | head -1
           echo "the whole-file mutation blew the ceiling, as it must"
         env:
           SCION_TEST_RESTORE_BIG: "1"
