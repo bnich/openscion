@@ -32,9 +32,19 @@ pub struct CommitArgs {
     #[arg(long, env = "SCION_AUTHOR", default_value = "scn <scn@localhost>")]
     author: String,
     /// Take the changes from the overlay of a `scn mount` on DIR, instead
-    /// of --put and --delete.
+    /// of --put and --delete. A build without the
+    /// `unstable-writable-mount` feature refuses it before it connects.
     #[arg(long = "from-mount", value_name = "DIR", conflicts_with_all = ["puts", "deletes", "executable"])]
     from_mount: Option<PathBuf>,
+}
+
+impl CommitArgs {
+    /// Whether this commit takes its changes from a mount's overlay,
+    /// which only a build with the `unstable-writable-mount` feature
+    /// serves.
+    pub fn from_mount(&self) -> bool {
+        self.from_mount.is_some()
+    }
 }
 
 fn parse_put(spec: &str) -> Result<(String, PathBuf), String> {
@@ -56,6 +66,9 @@ enum Edit {
 
 /// Uploads the files, creates the changeset, and prints its ID.
 pub async fn commit(ctx: &mut Ctx, args: CommitArgs) -> Result<()> {
+    // A build without the writable-mount feature refused the mount
+    // argument in `main`, before anything connected; the write path it
+    // guards is compiled out of that build.
     let (name, email) = parse_author(&args.author)?;
     let edits = match &args.from_mount {
         None => arg_edits(&args)?,
@@ -99,8 +112,10 @@ pub async fn commit(ctx: &mut Ctx, args: CommitArgs) -> Result<()> {
         let state = match edit {
             Edit::Delete => None,
             Edit::Link(target) => {
-                // SHORTCUT: reads each target whole, so memory caps the
-                // length. Upgrade: stream chunks.
+                // SHORTCUT: reads each target whole, but a target is one
+                // path, so its length is PATH_MAX (4096 bytes on Linux,
+                // 1024 on macOS). Upgrade: none short of the protocol
+                // renaming symlink targets to blob ids.
                 let content = ctx
                     .put_blob(target)
                     .await
@@ -108,12 +123,9 @@ pub async fn commit(ctx: &mut Ctx, args: CommitArgs) -> Result<()> {
                 Some(FileState::Symlink { target: content })
             }
             Edit::Put { file, exec } => {
-                // SHORTCUT: reads each file whole, so memory caps the file
-                // size (the server caps it at 100 MiB). Upgrade: stream
-                // chunks from the file.
-                let data = read_put(&file)?;
+                check_put(&file)?;
                 let content = ctx
-                    .put_blob(data)
+                    .put_blob_file(&file)
                     .await
                     .with_context(|| format!("cannot upload {}", file.display()))?;
                 Some(FileState::Regular {
@@ -150,6 +162,10 @@ fn arg_edits(args: &CommitArgs) -> Result<BTreeMap<RepoPath, Edit>> {
     let mut edits = BTreeMap::new();
     let puts = args.puts.iter().map(|(path, file)| (path, Some(file)));
     for (path, file) in puts.chain(args.deletes.iter().map(|path| (path, None))) {
+        ensure!(
+            !path.starts_with('/'),
+            "bad path {path:?}: repo paths are relative to the repository root, not to this machine"
+        );
         let path = RepoPath::new(path.as_str()).with_context(|| format!("bad path {path:?}"))?;
         ensure!(
             !edits.contains_key(&path),
@@ -167,10 +183,10 @@ fn arg_edits(args: &CommitArgs) -> Result<BTreeMap<RepoPath, Edit>> {
     Ok(edits)
 }
 
-/// Reads the local file of a put, and refuses anything that is not a
-/// regular file: a device or FIFO never sees an end, so the read would
+/// Refuses anything that is not a regular file, before any byte is
+/// read: a device or FIFO never sees an end, so a stream of one would
 /// grow until the OOM killer.
-fn read_put(file: &Path) -> Result<Vec<u8>> {
+fn check_put(file: &Path) -> Result<()> {
     let meta =
         std::fs::metadata(file).with_context(|| format!("cannot read {}", file.display()))?;
     if !meta.is_file() {
@@ -179,7 +195,7 @@ fn read_put(file: &Path) -> Result<Vec<u8>> {
             file.display()
         );
     }
-    std::fs::read(file).with_context(|| format!("cannot read {}", file.display()))
+    Ok(())
 }
 
 /// Splits `Name <email>` into name and email bytes.
@@ -206,6 +222,30 @@ mod tests {
         let (name, email) = parse_author("Ada Lovelace <ada@example.com>").unwrap();
         assert_eq!(name, b"Ada Lovelace");
         assert_eq!(email, b"ada@example.com");
+    }
+
+    /// An absolute repo path names a file on this machine, not in the
+    /// repo: the refusal says repo paths are relative, and names the
+    /// path, instead of `RepoPath`'s "empty part".
+    #[test]
+    fn an_absolute_repo_path_says_repo_paths_are_relative() {
+        let args = CommitArgs {
+            base: "main".into(),
+            message: "m".into(),
+            puts: vec![("/tmp/hello.txt".into(), "hello.txt".into())],
+            executable: false,
+            deletes: vec![],
+            author: "scn <scn@localhost>".into(),
+            from_mount: None,
+        };
+        let err = match arg_edits(&args) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("an absolute repo path was accepted"),
+        };
+        assert!(
+            err.contains("repo paths are relative") && err.contains("/tmp/hello.txt"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -235,7 +275,7 @@ mod tests {
         let _serial = crate::fork_gate::serial();
         let refused = |file: std::path::PathBuf| {
             let (sent, done) = std::sync::mpsc::channel();
-            std::thread::spawn(move || sent.send(read_put(&file).is_err()).unwrap());
+            std::thread::spawn(move || sent.send(check_put(&file).is_err()).unwrap());
             // The refusal needs no read: one that hangs fails the test.
             done.recv_timeout(Duration::from_secs(2))
                 .unwrap_or_else(|_| panic!("the read was not refused at once"))

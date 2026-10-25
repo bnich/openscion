@@ -196,6 +196,7 @@ async fn serve_with_audit(
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: Arc::new(Metrics::default()),
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         Some(Arc::new(Keys::generate())),
         async {
@@ -633,7 +634,9 @@ async fn exercise() -> (tempfile::TempDir, std::path::PathBuf) {
 
     // The collector's own admin lines: one run of the gc subcommand,
     // against its own empty store, appending to this same audit file.
+    // The binary refuses a missing data directory (#578); make it first.
     let gc_data = dir.path().join("gc-data");
+    fs::create_dir_all(&gc_data).unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
         .arg("--data")
         .arg(&gc_data)

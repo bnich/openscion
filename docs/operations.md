@@ -36,8 +36,11 @@ printf %s "$SCION_TOKEN" > /srv/scion-token
 ./scion-server --data /srv/scion serve --token-file /srv/scion-token
 ```
 
-The `umask 077` and the printf make the token file private (0600). The
-serve command creates the data directory if it does not exist, keeps
+The `umask 077` and the printf make the token file private (0600). A
+data directory the server does not find is refused, not created: every
+subcommand except restore answers "<path> does not exist; create it or
+pass --data" (#578), so make the directory before the first command.
+The serve command keeps
 its files private, and serves. The log's `serving` line names the address.
 
 ```sh
@@ -54,36 +57,77 @@ git -C /srv/git/my-repo log --oneline -1
 ```
 
 The first import makes the repo (named `main` unless `--repo` says
-otherwise), and a client's `scn log main` reads it back; the import can
-run while the server serves.
+otherwise), and a client reads it back:
+
+```sh
+SCION_SERVER=http://127.0.0.1:7878 scn --token-file /srv/scion-token log main
+```
+
+The client's global flags (`--server`, `--token-file`) go before the
+subcommand; the environment forms are `SCION_SERVER` and `SCION_TOKEN`.
+The import can run while the server serves.
 
 Proof: crates/scion-server/tests/first_boot.rs::a_first_boot_serves_probes_and_reads_back
 
 ### One server
 
 ```sh
+install -d -m 0700 /srv/scion
 SCION_TOKEN=<TOKEN> ./scion-server --data /srv/scion serve
 ```
 
 That is the whole deployment: clients talk to `127.0.0.1:7878` (or `--listen`
-HOST:PORT). The data directory holds every blob and every row, so keep it
+HOST:PORT). `install -d -m 0700` makes the directory the mode it says, whatever
+the umask is - under umask 002 (Ubuntu's user private groups) a plain `mkdir`
+makes a group-writable directory, and the server refuses it; the error names
+the chmod that fixes it. The data directory holds every blob and every row, so keep it
 mode 0700 and owned by the user the server runs as: the server refuses one
 that group or others can write, or that sits under a directory another user
 can change. Without `--ticket-key` no object is readable, so a real server
 adds a ticket key (section 2):
 
 ```sh
-./scion-server ticket-key --out /srv/scion-keys/ticket.key   # prints the public key
+./scion-server --data /srv/scion ticket-key --out /srv/scion-keys/ticket.key \
+  | tee /srv/scion-keys/ticket.pub   # prints the public key
 chmod 600 /srv/scion-keys/ticket.key
 ./scion-server --data /srv/scion serve --token <TOKEN> \
   --ticket-key /srv/scion-keys/ticket.key
 ```
+
+The public key lands in `ticket.pub`, kept for the next rotation's
+`--ticket-key-old` (section 2).
+
+`ticket-key` records its run in the data directory's audit log, so it
+takes the same `--data` as the serve line.
 
 Size the process with the three connection caps: `--max-connections` (128)
 bounds the clients served at once, `--max-streams` (256) bounds the calls
 one client may hold open at once, and `--max-stalled-bytes` (64 MiB)
 bounds what the stalled replies of one connection may hold before the
 connection is closed. A cache and a daemon take the same three flags.
+
+What one server process can hold for clients that never read, at the
+defaults, in the worst case:
+
+    128 connections x 64 MiB stalled bytes   8192 MiB
+    the read budget (whole-object replies)     256 MiB
+    the reply budget (unary replies)           128 MiB
+    ------------------------------------------ --------
+    about                                      8.4 GiB
+
+The first line is `--max-connections` x `--max-stalled-bytes`
+(`DEFAULT_CONNECTIONS`, `DEFAULT_STALLED_BYTES` in
+crates/scion-proto/src/runtime/listen.rs): a connection whose stalled
+replies hold more than `--max-stalled-bytes` is closed, and what they
+hold goes free, so a slow client costs at most its own connection,
+not a share of the server. The second is the read budget that a
+whole-object reply's built body takes before the body is built
+(`READ_BUDGET_BYTES` in crates/scion-server/src/service.rs); the
+third is the unary-reply budget (`REPLY_MEMORY_BUDGET` in
+crates/scion-server/src/reply.rs). Size the server's memory from that
+sum: fewer connections, a smaller stall cap, or both, take the first
+line down linearly.
+
 
 Choose the tokens with care: `--token T` (or `SCION_TOKEN=T`) makes one
 principal, `default`, with every right on every repo. A token on the command
@@ -171,7 +215,7 @@ client's `--token` is what it sends, the other side of the pair of the tier
 in front of it.
 
 ```sh
-SCION_TOKEN=<CACHE_TOKEN> SCION_UPSTREAM_TOKEN=<SERVER_TOKEN> \
+SCION_TOKEN=<SERVER_TOKEN> SCION_UPSTREAM_TOKEN=<SERVER_TOKEN> \
   ./scion-cache --upstream http://SERVER:7878 \
   --ticket-public-key <PUBLIC_KEY_HEX>
 ```
@@ -180,16 +224,28 @@ The cache keeps its objects in memory and drops the least recently used
 first: `--max-bytes` (1 GiB) is the most object bytes it holds. A snapshot
 holds at most `--snapshot-bytes` object bytes (256 MiB).
 
-The cache needs `--ticket-public-key` (the hex that `ticket-key` printed):
-without it, it serves no objects. A `scn` user then points reads at the
-cache with `scn checkout --server http://SERVER:7878 --objects http://CACHE:7879`.
+The cache needs `--ticket-public-key` (the hex that `ticket-key` printed),
+and refuses to start without one: a cache that checked no ticket would
+serve every object it holds to any caller that names an object ID. A
+`scn` user then points reads at the cache with
+`scn checkout --server http://SERVER:7878 --objects http://CACHE:7879`.
+
+One token rule the flag list hides (section 2 says it for the daemon
+chain): `scn` sends its one `--token` on every call, to the server and to
+the cache, so the token the user holds must be accepted by both. The
+example gives the cache the same caller token the server holds.
 
 ### Server, cache, and a daemon per user
 
 ```sh
+mkdir -p ~/.scion-daemon
 SCION_TOKEN=<USER_TOKEN> SCION_UPSTREAM_TOKEN=<CACHE_TOKEN> \
   ./scion-daemon --data ~/.scion-daemon --upstream http://CACHE:7879
 ```
+
+The daemon refuses a data directory that does not exist, like the
+server does: a typo must not make a new empty store and serve from
+it.
 
 The daemon's data directory must be private to its user (mode 0700, not a
 shared path such as `/tmp`); it serves on a 0600 Unix socket in it
@@ -230,8 +286,17 @@ line is readable by every local account (`ps`), an environment value
 by the same user and root, and a file with the checks of the access
 file by whoever can read it.
 
+The database must hold the schema before the first serve: an open whose
+`search_path` names a schema that does not exist is refused (`the URL's
+search_path names no existing schema; create it first`). Make it once,
+before the first start:
+
 ```sh
-printf 'postgres://user@dbhost/scion?sslmode=require\n' > /srv/scion/db-url
+psql 'postgres://user@dbhost/scion?sslmode=require' -c 'CREATE SCHEMA scion'
+```
+
+```sh
+printf 'postgres://user@dbhost/scion?sslmode=require&options=--search_path%3Dscion\n' > /srv/scion/db-url
 chmod 600 /srv/scion/db-url
 scion-server --data /srv/scion \
   --postgres-url-file /srv/scion/db-url \
@@ -274,7 +339,10 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
   server's own 9, the operator's tooling beside it (`pg_dump`, `psql`,
   a metrics scraper), and a margin. A database at its connection cap
   refuses the server's next connection, and every call that needs one
-  answers `unavailable` until one is free.
+  answers `unavailable` until one is free. While the writer is idle, its
+  connection pings the database with one autocommit `SELECT 1` a minute:
+  a lost connection or a lost fence surfaces on the probe instead of
+  hanging the next write.
 - The one-server rule and the write queue are Postgres advisory locks,
   visible as `pg_locks` rows of kind `advisory`: the one-server lock is
   a key of the schema `current_schema()` names, the migration lock is a
@@ -315,7 +383,7 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
   client calls: the check runs on the server's own session, through the
   same queue as every statement, never on a second connection.
 - A start after an unclean kill can refuse its open with "another
-  server holds this database": the dead server's session is still in
+  server holds this store" (the refusal's exact text): the dead server's session is still in
   the database, and the one-server lock dies only when Postgres ends
   that session. On the same host that is at once - the kernel closes a
   dead process's sockets - so the service manager's restart
@@ -332,9 +400,30 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
 - The SQLite store has none of this: one file is opened by one process at
   the kernel level, so there is no lock to lose and no fence. The notes
   above that name the one-server lock and the fence are Postgres only.
+- Re-pairing a lost marker: if an open refuses with "this database names
+  the store ..., but the data directory carries no marker of it" and the
+  directory IS the one this database was served with — its blob files
+  are there — the `backend` marker file was lost and can be written
+  back. The marker is two lines: `postgres`, then the 32 hex digits the
+  error text names (lowercase, no dashes). Write it exactly:
+
+  ```sh
+  printf 'postgres\n<uuid-from-the-error>\n' > /srv/scion/backend
+  ```
+
+  then start the server. Do NOT do this for a directory the database
+  was never served with: its blob files are missing, and the correct
+  move is a different directory (`--data`), not a marker. A UUID line
+  that is not 32 hex digits counts as no UUID at all - the open refuses
+  again with the same "carries no marker" message - so check what you
+  wrote (for example `od -c /srv/scion/backend`) before you conclude
+  the re-pairing failed.
 
 Backup and restore of a Postgres-backed server: `pg_dump` the database
-first, then copy the data directory. A changeset in the dump names only
+first, then copy the data directory. One database can hold several stores,
+each in its own schema; a dump of the database backs up every store in it,
+and one store alone is `pg_dump --schema <name>` (its restore reads back
+into the schema of the same name). A changeset in the dump names only
 blob files that existed when the dump was taken, and a blob file is written
 before its database row commits, so the later copy holds every file the
 dump names. Restore into a fresh database, copy the data directory back,
@@ -344,11 +433,16 @@ start the server with the same `--postgres-url`.
 
 `--token` and `--access` are exclusive. An access file names tokens by their
 BLAKE3 digest (never the token itself) and maps each to a principal with
-per-repo read and write rules:
+per-repo read and write rules. Every line is tab-separated, and the columns
+are: the line's kind (`token`, `read`, `write`), the principal, then what
+the line grants - a digest on a `token` line, a repo name on a `read` or
+`write` line. A `read` or `write` line may carry one more column, a path
+prefix that limits the rule to that folder (`read\tops\tmain\tsrc/a`
+covers `src/a/...`, not `srcx`); without it the line covers the whole repo:
 
 ```sh
 TOK=$(printf %s <SECRET> | ./scion-server hash-token)
-printf 'token\tops\t%s\nread\tops\tr\nwrite\tops\tr\n' "$TOK" > /srv/scion/access.txt
+printf 'token\tops\t%s\nread\tops\tmain\nwrite\tops\tmain\n' "$TOK" > /srv/scion/access.txt
 chmod 600 /srv/scion/access.txt
 ./scion-server --data /srv/scion serve --access /srv/scion/access.txt \
   --ticket-key /srv/scion-keys/ticket.key
@@ -363,7 +457,10 @@ principal, so the caps are off unless a flag sets one.
 Rewriting the access file takes effect at the next start (or restart): the
 server reads it once. A ticket keeps working for its whole life after a
 reload that narrows its principal, up to 15 minutes from signing, on this
-server and on any cache that holds the repo's objects. To revoke reads:
+server and on any cache that holds the repo's objects. Tickets live by the
+server's clock: a clock stepped back extends every live ticket by up to the
+60 seconds of skew the check allows, so run NTP in slew mode, not step, on
+a machine that serves tickets. To revoke reads:
 rewrite the file and restart, and either wait out the tickets (15 minutes)
 or rotate the ticket key (`--ticket-key`) to cut them off at once. Objects
 already on a user's daemon are out of reach of both; give a daemon only
@@ -453,7 +550,15 @@ walk refused. Metrics are for the operator, not for the readers.
 The server and the cache refuse a non-loopback address unless they serve TLS
 (`--tls-cert` and `--tls-key`) or get `--insecure-listen`. A client trusts a
 private CA: `scn --tls-ca ca.pem`, a tier for its upstream with its own
-`--tls-ca`. Between tiers, either end can demand a client certificate
+`--tls-ca`. A tier that names an https upstream but gives no `--tls-ca`
+refuses to start. A tier whose `--tls-ca` did not sign the upstream's
+certificate starts, and fails at its first object fetch: the reply answers
+`unavailable` ('received corrupt message of type InvalidContentType') and
+the tier's log carries
+`WARN scion_tier: fetch from upstream failed ... InvalidContentType` - a
+cache must start while its upstream is briefly down, so the certificate is
+checked by the first call, not at start. Between tiers, either end can
+demand a client certificate
 (`--tls-client-ca` on the server or cache; `--tls-client-cert` and
 `--tls-client-key` on the cache or daemon). A bearer token over plain TCP to
 a non-loopback address stays refused.
@@ -516,6 +621,7 @@ its value is readable by every local account through `ps`.
 | --- | --- | --- | --- |
 | `SCION_DATA` | `--data` | `scion-server` | Data directory, default `scion-data`. |
 | `SCION_POSTGRES_URL` | `--postgres-url` | `scion-server` | The URL holds the database credentials; the environment keeps them out of the process list (`ps`). `--postgres-url-file` reads it from a file the owner alone may read, and the argv form is deprecated: it warns now and goes away in a later release. |
+| `SCION_POSTGRES_URL_FILE` | `--postgres-url-file` | `scion-server` | A file that holds the database URL. Only its owner may read it, and a symlink is refused. |
 | `SCION_TOKEN` | `--token` | `scion-server` (`serve`, `hash-token`), `scion-cache`, `scion-daemon`, `scn` | A secret; the environment keeps it out of the process list. The `--token-file` flag reads the token from a file the owner alone may read, and `hash-token` reads it from stdin. The argv form prints a deprecation warning and goes away in a later release. |
 | `SCION_UPSTREAM_TOKEN` | `--upstream-token` | `scion-cache`, `scion-daemon` | A secret, as `SCION_TOKEN`; `--upstream-token-file` reads it from a file, and the argv form is deprecated: it warns now and goes away in a later release. |
 | `SCION_DAEMON_DATA` | `--data` | `scion-daemon` | Data directory, default `scion-daemon-data`. |
@@ -539,8 +645,10 @@ symlink, or that sits under directories another user can change.
 
 Rotation, step by step:
 
-1. Make the new key: `scion-server ticket-key --out NEW.key` — it prints the
-   new public key as 64 hex characters.
+1. Make the new key, and capture its public key into its own file, kept
+   for the next rotation:
+   `scion-server --data /srv/scion ticket-key --out NEW.key | tee NEW.pub`
+   — it prints the new public key as 64 hex characters.
 2. Give the tiers both public keys, new first, **before** the server moves
    to the new key — a cache that verifies only the old key refuses every
    ticket the new server mints:
@@ -548,10 +656,12 @@ Rotation, step by step:
    flag; two are the most). Restart the caches; a cache that verifies
    against both serves tickets of either key.
 3. Restart the server with both keys: `--ticket-key NEW.key
-   --ticket-key-old OLD-PUBLIC`. The old argument is a file holding the
-   **public** key of the previous key (the hex that the old run printed),
-   not its seed — and the file holds the bare hex and nothing else: 64
-   hex characters, no `name=` prefix, no trailing line. A public key is
+   --ticket-key-old OLD-PUBLIC`. The old argument is the previous key's
+   `.pub` file - the public key that the run which made the **previous**
+   key captured (step 1 the last time), not its seed, and not this
+   rotation's new key. The file's text is trimmed when read, so a
+   trailing newline is fine; what it holds is the bare 64-hex public
+   key and nothing else. A public key is
    not a secret: anyone may read the file, but group and others must not
    be able to WRITE it (a changed key breaks every tier that verifies
    against the old one), it must not be a symlink, and the directories
@@ -692,9 +802,10 @@ read, prints the seconds, and fails past a 600 s bound. The measured
 time includes the fsync of every restored file and directory: a
 restore is done when a crash cannot lose it. A real store's restore
 time scales with its blob bytes and its changeset count. On the fixed
-runner that store restored in 10.5 s (run 39539498175: 72 MiB/s on
-disk, 1147 changesets/s; the 750 MiB on disk matched the raw bytes,
-and the store built in 28.0 s). One sample at one size; a second size
+runner that store restored in 10.5 s (run
+[39539498175](https://github.com/bnsd55/openscion/actions/runs/39539498175)
+on `main` at `39364422`: 72 MiB/s on disk, 1147 changesets/s; the
+750 MiB on disk matched the raw bytes, and the store built in 28.0 s). One sample at one size; a second size
 is the next step when the number starts steering a decision. The
 current numbers live in the workflow's run log on `main`, and a run
 that drifts far from them is a regression to look at, not a promise
@@ -703,6 +814,26 @@ to restate here.
 Proof: crates/scion-server/tests/restore_bench.rs::a_restore_of_a_stated_store_takes_a_stated_time
 
 Proof: crates/scion-server/tests/backup.rs::a_backup_taken_while_serving_restores_whole
+
+On Postgres, a restore's staging schema carries a `restore_staging`
+mark from its first transaction until publication, so a restore drops
+only what a restore made: a schema that names a store and no mark is
+refused ("a restore refuses to drop a store it did not make"), never
+dropped. One window sits between a restore's last transaction and the
+rename that publishes its data directory: a restore killed there
+leaves a complete store in the schema with no mark, and the next
+restore at that URL refuses it and names the way out - rename the
+target's `<name>.restoring` directory into place and start a server on
+it, or restore into a new schema.
+
+One warning about that name: a restore's **start** deletes a
+`<name>.restoring` directory beside the target without asking - it is
+the scratch of a run that died mid-replay, never a store. Keep nothing
+under that name, and rename a leftover into place (the way out above)
+before you start the next restore.
+
+Proof: crates/scion-server/tests/archive_attacks.rs::a_restore_at_a_stopped_stores_url_refuses_and_leaves_it_whole (behaviour, no command: the proof arms a crafted archive against a stopped store's own URL, which no guide command reproduces)
+Proof: crates/scion-server/tests/archive_attacks.rs::a_restored_store_does_not_carry_the_mark_and_a_later_restore_refuses (behaviour, no command: the proof replays a zero-repo archive and writes into the restored store, which no guide command reproduces)
 
 ## 4. Upgrades
 
@@ -745,11 +876,34 @@ Proof: crates/scion-server/tests/crash.rs::a_newer_schema_refuses_the_open_and_a
 An import reads git revision `--rev` (default `HEAD`) into scion repo
 `--repo` (default `main`), and points scion ref `--ref` (default `main`)
 at the imported tip. Besides every root and merge, it re-checks `--verify`
-(default 100) ordinary commits against git.
+(default 100) ordinary commits against git. A commit whose author or
+committer line carries git's unknown-offset zone `-0000` is refused: the
+offset is unknown, not zero, and importing it would fold the sign into
+the stored history. Every real zone imports with its offset; fix or
+re-date such a commit in the git history and import again.
 
 So an upgrade is: stop the server (and any tiers that share the directory —
 none do by default), copy the directory as a backup (section 3), start the
-new binary, watch the log for the migration, run `fsck`. Schema 7 (tree
+new binary, watch the log for the migration, run `fsck`. A store that
+has data logs its migration steps when a build migrates it; a first
+boot on a fresh, empty directory logs no migration - it says the store
+was created.
+
+Where the binaries come from. v0.1.0 is a source release: build the
+version you need from its signed tag (`docs/RELEASING.md`):
+
+```sh
+git checkout <tag>
+cargo build --release --locked
+```
+
+A release that ships binaries says so in its release notes, and
+`docs/verify.md` verifies them. Whichever way the binaries came, keep
+the previous build's binaries beside the new ones **before** an
+upgrade: the rollback below needs them, because rebuilding the old tag
+mid-incident needs the toolchain and the time you do not have.
+
+Schema 7 (tree
 entry sizes, `#172`) drops every stored tree and its derived rows, so the
 first queries after it re-derive trees from the stored changesets; the
 blobs and changesets stay. A tier's store may keep tree bytes of the old
@@ -990,8 +1144,11 @@ reconnects.
 that mean something. Every line of a call carries the `call` span's
 fields, `rpc`, `peer` and `request_id`: one `scn` command sends one
 `x-request-id` through every hop, so a grep for `request_id=<id>` in the
-logs of scn, the daemon, the cache and the server shows the whole path
-of one operation.
+logs of scn and the server shows the whole path of one operation. A
+cache or a daemon logs a call only at DEBUG — its per-call counts are
+the metrics' `scion_cache_hits_total` and `scion_cache_misses_total` —
+so at the default level those hops answer through the metrics, not the
+log.
 
 - `the call is unauthenticated` — a call without a valid token. A few are
   normal (a scanner, a stale client); a stream of them is a client with a
@@ -1021,6 +1178,17 @@ of one operation.
 - `the stale-land sweep failed` / `the stale-land sweep task failed` — the
   hourly sweep could not run. Lands then pile up past
   `--land-stale-secs`; look at the error above it.
+- `a unary reply refused: the reply budget is spent` — a client holds
+  more than the reply budget (128 MiB of unary replies it never read,
+  across every connection); further unary reads are refused
+  `resource_exhausted` until it reads what it opened or its connections
+  close. The warn carries only the size, but the line sits in the
+  call's span, whose fields name the client: every log line of a call
+  carries `rpc`, `peer` and `request_id`.
+- `a committed write's reply is over the reply budget: sent uncounted` —
+  the budget was spent, but the call changed state and its answer went
+  out anyway: the write landed and the client got the truth. Nothing was
+  lost; fix the client that holds the budget.
 
 A ticket refusal, an access refusal, or a corrupt blob each log one line
 per event, never the bytes or the token that caused them.
@@ -1139,6 +1307,14 @@ Tell the causes apart:
   `--max-stalled-bytes` only if the box has the memory for it, or add a
   cache tier so the large replies do not all reach the server.
 
+- Many clients leave whole unary replies unread: they hold the server's
+  reply budget (128 MiB), and further unary reads are refused
+  `resource_exhausted` until they read or disconnect. This alert does
+  not fire for them — the gauge counts stalled streams, not parked
+  whole replies — the refusal's warn line
+  (`a unary reply refused: the reply budget is spent`) and the RPC's
+  `resource_exhausted` count name it.
+
 Escalate when the close notice repeats for one peer and the client is
 not yours to fix: the client's owner stops the waste, not the server.
 
@@ -1193,32 +1369,39 @@ checking out through a cache and a daemon beside it.
 
 | | |
 |---|---|
-| Commit | the `git rev-parse HEAD` of the run that produced the table |
-| Runner | the hosted runner class, by its public label and spec |
+| Commit | 07198dd728c754ad7a79ba526cb2227e620490b0 the main commit the run measured (the run's own HEAD, `62fb2183`, fixes the throughput column's sum only), at [run 40212691905](https://github.com/bnsd55/openscion/actions/runs/40212691905) |
+| Runner | GitHub-hosted `ubuntu-24.04`: 4 vCPU, 16 GiB RAM, ext4 on a ~144 GiB SSD, runner image `ubuntu24 20261023.334.3`, kernel `6.17.0-1022-azure` (the run's `machine.txt` artifact) |
+| Filesystem | the filesystem the run measured, from the run's `machine.txt` artifact (`df -T` on the work directory); the `ubuntu-24.04` class's root disk is ext4 ([support.md](support.md)) |
 | Repetitions | 2 per cell; the table reports the cell's whole run, and the run's raw samples are the workflow run's `capacity.csv` artifact |
 
-| backend | writers | readers | lands/min | land p99 ms | checkout p50 ms | checkout p99 ms | errors | server RSS MiB | store KiB per 1k lands |
-|---|---|---|---|---|---|---|---|---|---|
-| sqlite | 2 | 0 | - | - | - | - | - | - | - |
-| sqlite | 2 | 5 | - | - | - | - | - | - | - |
-| sqlite | 2 | 20 | - | - | - | - | - | - | - |
-| sqlite | 50 | 0 | - | - | - | - | - | - | - |
-| sqlite | 50 | 5 | - | - | - | - | - | - | - |
-| sqlite | 50 | 20 | - | - | - | - | - | - | - |
-| sqlite | 200 | 0 | - | - | - | - | - | - | - |
-| sqlite | 200 | 5 | - | - | - | - | - | - | - |
-| sqlite | 200 | 20 | - | - | - | - | - | - | - |
-| postgres | 2 | 0 | - | - | - | - | - | - | - |
-| postgres | 2 | 5 | - | - | - | - | - | - | - |
-| postgres | 2 | 20 | - | - | - | - | - | - | - |
-| postgres | 50 | 0 | - | - | - | - | - | - | - |
-| postgres | 50 | 5 | - | - | - | - | - | - | - |
-| postgres | 50 | 20 | - | - | - | - | - | - | - |
-| postgres | 200 | 0 | - | - | - | - | - | - | - |
-| postgres | 200 | 5 | - | - | - | - | - | - | - |
-| postgres | 200 | 20 | - | - | - | - | - | - | - |
+| backend | writers | readers | land p99 ms | checkout p50 ms | checkout p99 ms | timeouts | errors | server RSS MiB | landed | lands per second | blob store KiB per 1k lands | database KiB per 1k lands |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| sqlite | 2 | 0 | 12.6 | - | - | 0 | 0 | 27 | 2000 | 185.5 | 112344 | - |
+| sqlite | 2 | 5 | 28.0 | 170 | 233 | 0 | 0 | 30 | 2000 | 78.4 | 112372 | - |
+| sqlite | 2 | 20 | 91.4 | 671 | 813 | 0 | 0 | 31 | 2000 | 28.7 | 112256 | - |
+| sqlite | 50 | 0 | 216 | - | - | 0 | 0 | 42 | 2000 | 249.8 | 58896 | - |
+| sqlite | 50 | 5 | 461 | 171 | 243 | 0 | 0 | 48 | 2000 | 115.4 | 58864 | - |
+| sqlite | 50 | 20 | 1507 | 678 | 839 | 0 | 0 | 50 | 2000 | 39.6 | 58844 | - |
+| sqlite | 200 | 0 | 906 | - | - | 0 | 0 | 57 | 2000 | 234.4 | 78296 | - |
+| sqlite | 200 | 5 | 1967 | 172 | 246 | 0 | 0 | 74 | 2000 | 106.9 | 78328 | - |
+| sqlite | 200 | 20 | 8751 | 669 | 825 | 0 | 0 | 76 | 2000 | 38.8 | 78388 | - |
+| postgres | 2 | 0 | 59.9 | - | - | 0 | 0 | 20 | 2000 | 21.1 | 5666 | 85454 |
+| postgres | 2 | 5 | 126 | 248 | 290 | 0 | 0 | 23 | 2000 | 11.2 | 5670 | 85078 |
+| postgres | 2 | 20 | 256 | 844 | 1033 | 0 | 0 | 25 | 2000 | 8.0 | 5674 | 87506 |
+| postgres | 50 | 0 | 2233 | - | - | 0 | 0 | 32 | 2000 | 22.4 | 5668 | 34520 |
+| postgres | 50 | 5 | 4478 | 253 | 296 | 0 | 0 | 37 | 2000 | 12.2 | 5668 | 34458 |
+| postgres | 50 | 20 | 7857 | 870 | 1083 | 0 | 0 | 39 | 2000 | 8.3 | 5668 | 34578 |
+| postgres | 200 | 0 | 9249 | - | - | 0 | 0 | 44 | 2000 | 21.8 | 5664 | 62298 |
+| postgres | 200 | 5 | 17017 | 253 | 299 | 0 | 0 | 63 | 2000 | 12.1 | 5668 | 62318 |
+| postgres | 200 | 20 | 29960 | 874 | 1085 | 0 | 0 | 64 | 2000 | 8.3 | 5670 | 62270 |
 
-The cells with `-` are the ones no run has filled yet. The errors column
+Every cell runs on a store the cell's own import made: on SQLite a data directory
+the cell created, on Postgres a database the cell dropped and
+recreated, so a cell's numbers are the store's at its own size, and
+the growth column is the cell's own lands' bytes. The timeouts column
+counts reader attempts the 60-second checkout timeout killed; it is
+its own column because a hang is a finding, not noise. The errors
+column
 is part of the data, not a failure of the run: the envelope's edge IS
 where errors start, so a cell whose clients failed is recorded with its
 error count and stands in the table. The edge, the point where a cell
@@ -1227,12 +1410,16 @@ stops being an answer: a checkout p99 over 5 seconds, a land p99 over
 in the table, that is a cell with errors above 0. A reader who wants a
 different edge applies it to the run's `capacity.csv` artifact, which
 the footer's workflow run keeps. A cell whose bench died names no land
-percentile (`-` there); its lands per minute still come from the
-server's counter.
+percentile (`-` there).
 
-The store growth column is the SQLite store's only; the Postgres cells
-name no store growth, because the database's disk is its service
-container's, not a file tree the script can measure. RSS is the server's
+The growth splits into two columns, both divided by the lands the
+server's counter measured - a cell that lost lands reports its own
+bytes over its own lands, never the plan's. The blob store column
+measures the cell's data directory; the database column measures the
+database the cell reset (`pg_database_size`), so a Postgres row cannot
+look complete while the rows it grew sit unmeasured in the service
+container. SQLite has no separate database, so its database column is
+"-". RSS is the server's
 at the end of the cell: a capacity cell is minutes long, not the hours a
 warm-up would need, so it is a level, not a leak bound - the leak bound
 is the soak's.
@@ -1247,10 +1434,11 @@ measures from the restart's command until readiness answers `SERVING`
 and the first read resolves a ref. It prints the seconds and fails past
 a 60 s bound. The kill is the runbook's crash: no flush, no drain -
 whatever the write-ahead log holds is what recovery starts from. On
-the fixed runner that recovery took 0.1 s (run 39623531102: readiness
-answered `SERVING` and the first read resolved within a tenth of a
-second of the restart's command, with 5 pending lands left by the
-kill; the store built in 0.7 s). One sample at one size; a second size
+the fixed runner that recovery took 0.1 s (run
+[39623531102](https://github.com/bnsd55/openscion/actions/runs/39623531102)
+on `main` at `a9f8df07`: readiness answered `SERVING` and the first
+read resolved within a tenth of a second of the restart's command,
+with 5 pending lands left by the kill; the store built in 0.7 s). One sample at one size; a second size
 is the next step when the number starts steering a decision. The
 current numbers live in the workflow's run log on `main`, and a run
 that drifts far from them is a regression to look at, not a promise to

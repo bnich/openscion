@@ -55,7 +55,7 @@ use scion_core::{BlobId, Changeset, ChangesetId};
 
 use crate::backend::Backend;
 use crate::db;
-use crate::meta::{Meta as _, MetaTx as _, RepoChangeset, RepoId};
+use crate::meta::{Meta as _, MetaTx, RepoChangeset, RepoId};
 use std::str::FromStr as _;
 
 /// Rows to read per batch, as `fsck` reads.
@@ -69,6 +69,60 @@ pub const SWEEP_BATCH: usize = 1000;
 /// transaction holds the collector's key, so its length bounds how long
 /// every writer waits behind it.
 const PRUNE_BATCH: usize = 256;
+
+/// The changeset bodies one body fetch of the prune reads, at most: a
+/// chunk of bodies holds at most this many bytes of bodies, so its
+/// memory is the budget plus one body (a single body larger than the
+/// budget is a chunk of its own). The way the import batches size
+/// themselves.
+const PRUNE_BODY_BUDGET: usize = 64 * 1024 * 1024;
+
+/// A test's override of the byte budget, behind the test hooks: the gc
+/// has one caller per process, so a plain static needs no ordering.
+#[cfg(any(test, feature = "test-hooks"))]
+static TEST_BODY_BUDGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The byte budget one body fetch of the prune reads. A test can shrink
+/// it with [`test_set_body_budget`]; a build without the hooks, and a
+/// test that set nothing, runs the compiled budget.
+fn prune_body_budget() -> usize {
+    #[cfg(any(test, feature = "test-hooks"))]
+    {
+        let override_ = TEST_BODY_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+        if override_ > 0 {
+            return override_;
+        }
+    }
+    PRUNE_BODY_BUDGET
+}
+
+/// Shrinks the byte budget of the prune's body fetches, for a test that
+/// exercises the chunker on small bodies. Pass zero to reset.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn test_set_body_budget(bytes: usize) {
+    TEST_BODY_BUDGET.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The body fetches the prune made since the last reset: one call to
+/// `stored_changeset_bodies` is one fetch. A test with a small byte
+/// budget asserts this is more than one, so the wiring really goes
+/// through the byte-budget chunker (a single fetch would mean the old
+/// row-chunked shape came back).
+#[cfg(any(test, feature = "test-hooks"))]
+static TEST_BODY_FETCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The body fetches the prune made since the last reset.
+#[cfg(any(test, feature = "test-hooks"))]
+#[must_use]
+pub fn test_body_fetch_count() -> u64 {
+    TEST_BODY_FETCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sets the body-fetch count back to zero.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn test_reset_body_fetch_count() {
+    TEST_BODY_FETCHES.store(0, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// The time one prune transaction or sweep batch may hold the collector's
 /// key before the run says so in the log. The row cap bounds the hold;
@@ -141,14 +195,23 @@ pub fn run(
     // One read names the repos for the start line and the prune; prune
     // rows walks them right after.
     let repos = store.read(|c| c.repos())?;
+    // The dry run's prune deletes nothing: it records the pairs it would
+    // remove, and its sweep subtracts them from the row check, the way
+    // the real run's delete does before it sweeps - so both runs report
+    // the same rows and files.
+    let mut dry = if dry_run {
+        Dry::WouldRemove(BTreeSet::new())
+    } else {
+        Dry::Real
+    };
     tracing::info!(
         repos = u64::try_from(repos.len()).unwrap_or(u64::MAX),
         grace_secs = grace.as_secs(),
         dry_run,
         "the collector walks the live set"
     );
-    prune_rows(store, &live, repos, grace, dry_run, between, &mut report)?;
-    sweep_files(store, grace, dry_run, between, &mut report)?;
+    prune_rows(store, &live, repos, grace, &mut dry, between, &mut report)?;
+    sweep_files(store, grace, &dry, between, &mut report)?;
     tracing::info!(
         repos = report.repos,
         rows_pruned = report.rows_pruned,
@@ -210,13 +273,15 @@ impl LiveSet {
 }
 
 /// Prunes the dead `repo_blobs` rows of each repo, in chunks of at most
-/// `PRUNE_BATCH` rows, one transaction per chunk.
+/// `PRUNE_BATCH` rows, one transaction per chunk. A dry run records the
+/// pairs it would remove instead of deleting them, and its sweep
+/// subtracts them, so both runs report the same files.
 fn prune_rows(
     store: &Backend,
     live: &LiveSet,
     repos: Vec<(RepoId, String)>,
     grace: Duration,
-    dry_run: bool,
+    dry: &mut Dry,
     between: &mut dyn FnMut(Stage),
     report: &mut Report,
 ) -> crate::error::Result<()> {
@@ -286,18 +351,26 @@ fn prune_rows(
                         unseen.push(cs.as_bytes().to_vec());
                     }
                 }
-                // The puts of every new changeset, bodies in chunks of
-                // [`DERIVED_BATCH`]: one statement per 1,000 ids instead
-                // of one per changeset. A missing body is skipped, as the
-                // walk reads it: `fsck` reports it.
-                // SHORTCUT: 1,000 bodies per statement; memory is 1,000 x
-                // the largest body in a chunk (an imported initial commit
-                // can hold MAX_CHANGES changes). Upgrade path if that
-                // matters: chunk by bytes (octet_length(body)) or a
-                // cursor with a fetch size.
-                let mut fresh = BTreeSet::new();
+                // The puts of every new changeset, bodies in chunks of at
+                // most [`PRUNE_BODY_BUDGET`] bytes: the lengths come
+                // first, then one fetch per byte-budget chunk, so a
+                // chunk's memory is the budget plus one body. A missing
+                // body is skipped, as the walk reads it: `fsck` reports
+                // it.
+                // The lengths, in row chunks of [`DERIVED_BATCH`]: ids
+                // and lengths only, 40 bytes a row, so holding them is
+                // fine; the statement must not grow with the repo (the
+                // sweep class of the production audit's database-loop
+                // section, bounded by #573).
+                let mut lengths = Vec::new();
                 for ids in unseen.chunks(crate::meta::DERIVED_BATCH) {
-                    for (id, body) in c.stored_changeset_bodies(ids)? {
+                    lengths.extend(c.stored_changeset_body_lengths(ids)?);
+                }
+                let mut fresh = BTreeSet::new();
+                for ids in bytes_chunks(&lengths, prune_body_budget()) {
+                    #[cfg(any(test, feature = "test-hooks"))]
+                    TEST_BODY_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    for (id, body) in c.stored_changeset_bodies(&ids)? {
                         let Ok(cs) = ChangesetId::try_from(id.as_slice()) else {
                             continue; // fsck reports the bad ID
                         };
@@ -314,8 +387,14 @@ fn prune_rows(
                     .filter(|blob| !fresh.contains(*blob))
                     .map(|blob| blob.as_bytes().to_vec())
                     .collect();
-                if !dry_run && !gone.is_empty() {
-                    c.delete_repo_blobs(repo, &gone)?;
+                match &mut *dry {
+                    Dry::Real if !gone.is_empty() => c.delete_repo_blobs(repo, &gone)?,
+                    Dry::Real => {}
+                    Dry::WouldRemove(would) => {
+                        for blob in &gone {
+                            would.insert((repo, blob.clone()));
+                        }
+                    }
                 }
                 report.rows_pruned += u64::try_from(gone.len()).unwrap_or(u64::MAX);
                 Ok(())
@@ -347,11 +426,61 @@ fn prune_rows(
     Ok(())
 }
 
+/// Splits the id-length list into chunks of at most `budget` bytes of
+/// bodies, in the list's order: a chunk's memory is its bodies' bytes, so
+/// a body larger than the budget is a chunk of its own. Empty ids name no
+/// chunk, and a zero budget would loop forever, so the caller passes the
+/// compiled budget when the test hook asks for zero.
+fn bytes_chunks(lengths: &[(Vec<u8>, i64)], budget: usize) -> Vec<Vec<Vec<u8>>> {
+    let budget = budget.max(1);
+    let mut chunks: Vec<Vec<Vec<u8>>> = Vec::new();
+    let mut chunk: Vec<Vec<u8>> = Vec::new();
+    let mut sum: u64 = 0;
+    for (id, len) in lengths {
+        let len = (*len).max(0).cast_unsigned();
+        if !chunk.is_empty() && sum + len > budget as u64 {
+            chunks.push(std::mem::take(&mut chunk));
+            sum = 0;
+        }
+        sum += len;
+        chunk.push(id.clone());
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
+}
+
+/// What a run deletes with: a real run removes the dead rows before its
+/// sweep; a dry run removes nothing and records the pairs its prune
+/// would remove, so its sweep can subtract them from the row check and
+/// report the same files the real run would.
+enum Dry {
+    Real,
+    WouldRemove(BTreeSet<(RepoId, Vec<u8>)>),
+}
+
+impl Dry {
+    /// Whether `blob` would survive the real run's sweep: every repo
+    /// that names it now is a pair the dry prune would remove. A repo
+    /// that named it in the snapshot and does not any more counts as
+    /// gone either way - no row, no name.
+    fn keeps_file(&self, c: &mut dyn MetaTx, blob: &[u8]) -> crate::error::Result<bool> {
+        match self {
+            Self::Real => Ok(c.any_repo_names(blob)?),
+            Self::WouldRemove(gone) => Ok(!c
+                .repos_naming(blob)?
+                .iter()
+                .all(|repo| gone.contains(&(*repo, blob.to_vec())))),
+        }
+    }
+}
+
 /// Unlinks the blob files that no row names, oldest first.
 fn sweep_files(
     store: &Backend,
     grace: Duration,
-    dry_run: bool,
+    dry: &Dry,
     between: &mut dyn FnMut(Stage),
     report: &mut Report,
 ) -> crate::error::Result<()> {
@@ -392,13 +521,13 @@ fn sweep_files(
                 // write anew. The metadata transaction orders the row
                 // check; the file work itself needs this lock.
                 let _dir = store.blobs().dir_flock(*id)?;
-                if c.any_repo_names(id.as_bytes())? {
+                if dry.keeps_file(c, id.as_bytes())? {
                     continue;
                 }
                 if file_mtime(path)? != Some(*listed) {
                     continue;
                 }
-                if !dry_run {
+                if matches!(dry, Dry::Real) {
                     std::fs::remove_file(path)?;
                 }
                 report.files_removed += 1;
@@ -488,6 +617,57 @@ mod tests {
     /// A deadline a test does not reach.
     fn later() -> Deadline {
         Deadline::new(Instant::now() + std::time::Duration::from_secs(600))
+    }
+
+    /// The byte-budget chunker: a chunk holds at most `budget` bytes of
+    /// bodies, a body larger than the budget is a chunk of its own, and
+    /// the order is the list's order. This is the bound the prune's
+    /// memory promise rests on; the integration test proves the wiring
+    /// goes through it.
+    #[test]
+    fn body_chunks_hold_at_most_the_budget_of_bodies() {
+        let id = |n: u8| vec![n; 8];
+        // 4 bodies of 600 bytes against a 1,000-byte budget: 2 chunks of
+        // 2, 3, ... the exact split the running sum makes.
+        let lengths: Vec<(Vec<u8>, i64)> = (0..4).map(|n| (id(n), 600)).collect();
+        let chunks = bytes_chunks(&lengths, 1_000);
+        eprintln!(
+            "4 bodies of 600 bytes at a 1,000-byte budget: {} chunks",
+            chunks.len()
+        );
+        assert!(
+            chunks.len() > 1,
+            "many budgets of bodies take more than one chunk"
+        );
+        for chunk in &chunks {
+            let sum: u64 = chunk
+                .iter()
+                .map(|id| {
+                    lengths
+                        .iter()
+                        .find(|(other, _)| other == id)
+                        .map_or(0, |(_, len)| (*len).max(0).cast_unsigned())
+                })
+                .sum();
+            assert!(sum <= 1_000, "a chunk holds at most the budget: {sum}");
+        }
+        // A single body larger than the budget is a chunk of its own: it
+        // must not be dropped, and no chunk may hold two of them.
+        let big: Vec<(Vec<u8>, i64)> = vec![(id(1), 5_000), (id(2), 5_000), (id(3), 100)];
+        let chunks = bytes_chunks(&big, 1_000);
+        eprintln!(
+            "two 5,000-byte bodies and one 100-byte body at a 1,000-byte budget: {} chunks",
+            chunks.len()
+        );
+        assert_eq!(chunks.len(), 3);
+        // The order is the list's order, and every id lands exactly once.
+        let flat: Vec<Vec<u8>> = chunks.concat();
+        assert_eq!(flat, vec![id(1), id(2), id(3)]);
+        // Empty ids name no chunk.
+        assert_eq!(bytes_chunks(&[], 1_000), Vec::<Vec<Vec<u8>>>::new());
+        // A zero budget would loop forever: the chunker clamps it to one.
+        let chunks = bytes_chunks(&lengths, 0);
+        assert_eq!(chunks.len(), lengths.len());
     }
 
     const REPO: &str = "gc";
@@ -906,42 +1086,299 @@ mod tests {
     }
 
     #[test]
-    fn a_dry_run_removes_nothing() {
+    fn a_dry_run_reports_what_the_real_run_would_remove() {
         let (_dir, store) = store();
         let x = uploaded(&store, b"dry\n");
         age_file(&Backend::sqlite(store.clone()), x, OLD);
-        let mut removed = 0;
-        let mut between = |stage: Stage| {
-            if stage == Stage::BlobFiles {
-                removed += 1;
-            }
-        };
         let report = run(
             &Backend::sqlite(store.clone()),
             Duration::from_secs(DEFAULT_GRACE_SECS),
             true,
-            &mut between,
+            &mut |_| {},
         )
         .unwrap();
-        // The report says what the stages would collect. In a real run the
-        // rows go first, and the sweep of the same run would then see no
-        // row; a dry run keeps the rows, so the sweep keeps the file too.
-        assert_eq!(report.rows_pruned, 1, "{report:?}");
-        assert_eq!(report.files_removed, 0, "{report:?}");
         // Nothing was removed: the row and the file are still there.
         assert!(named(&store, x));
         assert_eq!(
             store.blobs().verify(x).unwrap(),
             crate::store::BlobStatus::Valid
         );
-        // The real run after it collects both.
+        // The report is the real run's: the sweep subtracts the rows the
+        // dry prune would remove, the way the real run's delete does
+        // before it sweeps. A dead row must not keep its file out of the
+        // count, or an operator budgets the disk from a number that the
+        // run that follows doubles.
+        let real = collect(
+            &Backend::sqlite(store.clone()),
+            Duration::from_secs(DEFAULT_GRACE_SECS),
+            &mut |_| {},
+        );
+        assert_eq!(report.rows_pruned, real.rows_pruned, "{report:?} {real:?}");
+        assert_eq!(
+            report.files_removed, real.files_removed,
+            "{report:?} {real:?}"
+        );
+        assert_eq!(real.rows_pruned, 1, "{real:?}");
+        assert_eq!(real.files_removed, 1, "{real:?}");
+    }
+
+    /// A blob named by two repos, dead in one and live in the other: the
+    /// sweep must keep the file because ANY live name keeps it. A
+    /// `keeps_file` that asks whether SOME name survives the prune (an
+    /// `any` where the code says `all`) must not pass here.
+    #[test]
+    fn a_blob_live_in_another_repo_survives_a_dry_run() {
+        let (_dir, store) = store();
+        let b = uploaded(&store, b"shared\n");
+        store
+            .write(|c| {
+                let mut tx = SqliteTx(c);
+                let other = tx.create_repo("other")?;
+                // A stored changeset puts the blob, so repo other's row
+                // is live: nothing prunes it.
+                crate::tree::store_changeset(
+                    &mut tx,
+                    other,
+                    &cs(
+                        None,
+                        &[(
+                            "f",
+                            FileState::Regular {
+                                content: b,
+                                executable: false,
+                            },
+                        )],
+                    ),
+                    &mut crate::tree::lens_of(&Backend::sqlite(store.clone())),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        age_file(&Backend::sqlite(store.clone()), b, OLD);
+        let report = run(
+            &Backend::sqlite(store.clone()),
+            Duration::from_secs(DEFAULT_GRACE_SECS),
+            true,
+            &mut |_| {},
+        )
+        .unwrap();
+        // The dry run takes repo gc's dead row (the dry prune would), and
+        // the file stays: repo other's live row names it.
+        assert_eq!(report.rows_pruned, 1, "{report:?}");
+        assert_eq!(report.files_removed, 0, "{report:?}");
+        assert_eq!(
+            store.blobs().verify(b).unwrap(),
+            crate::store::BlobStatus::Valid
+        );
+        // The real run takes the same row and keeps the file, too.
         let real = collect(
             &Backend::sqlite(store.clone()),
             Duration::from_secs(DEFAULT_GRACE_SECS),
             &mut |_| {},
         );
         assert_eq!(real.rows_pruned, 1, "{real:?}");
-        assert_eq!(real.files_removed, 1, "{real:?}");
+        assert_eq!(real.files_removed, 0, "{real:?}");
+        assert_eq!(
+            store.blobs().verify(b).unwrap(),
+            crate::store::BlobStatus::Valid
+        );
+    }
+
+    /// The report names what the grace kept: one young row and one old
+    /// row, one fresh orphan file and one collected one. The counters are
+    /// the operator's picture of a run; a sign flip or a multiply by zero
+    /// would hide the rows and files the grace still holds.
+    #[test]
+    fn the_report_counts_what_the_grace_kept() {
+        let (_dir, store) = store();
+        let young = uploaded(&store, b"young row\n");
+        let old = uploaded(&store, b"old row\n");
+        age_file(
+            &Backend::sqlite(store.clone()),
+            young,
+            Duration::from_secs(1),
+        );
+        age_file(&Backend::sqlite(store.clone()), old, OLD);
+        // A fresh orphan file: no row names it, and it is young.
+        let fresh = store.blobs().put(b"fresh orphan\n").unwrap();
+        age_file(
+            &Backend::sqlite(store.clone()),
+            fresh,
+            Duration::from_secs(1),
+        );
+        let report = collect(
+            &Backend::sqlite(store.clone()),
+            Duration::from_secs(DEFAULT_GRACE_SECS),
+            &mut |_| {},
+        );
+        assert_eq!(report.rows_pruned, 1, "{report:?}");
+        assert_eq!(report.rows_young, 1, "{report:?}");
+        assert_eq!(report.files_removed, 1, "{report:?}");
+        assert_eq!(report.files_young, 2, "{report:?}");
+        assert!(named(&store, young));
+        assert!(!named(&store, old));
+    }
+
+    /// A walk whose pages end exactly on the batch still ends: the live
+    /// set stops when a page is short, so a store with exactly `BATCH`
+    /// changesets must take one more (empty) page and finish, not spin
+    /// forever on a page that never comes.
+    #[test]
+    fn a_walk_whose_pages_end_exactly_on_the_batch_still_ends() {
+        let (_dir, store) = store();
+        store
+            .write(|c| {
+                let repo = c.repo_id(REPO)?;
+                for n in 0..BATCH {
+                    let cs = Changeset::new(
+                        vec![],
+                        IdentityTime::new(
+                            b"Ada".to_vec(),
+                            b"ada@example.com".to_vec(),
+                            1_700_000_000,
+                            0,
+                        )
+                        .unwrap(),
+                        None,
+                        format!("walk {n}\n").into_bytes(),
+                        BTreeMap::default(),
+                    )
+                    .unwrap();
+                    c.insert_changeset(repo, &cs)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let report = collect(
+            &Backend::sqlite(store.clone()),
+            Duration::from_secs(DEFAULT_GRACE_SECS),
+            &mut |_| {},
+        );
+        assert_eq!(report.repos, 1, "{report:?}");
+        assert_eq!(report.rows_pruned, 0, "{report:?}");
+    }
+
+    /// The blob root is missing (a store that never stored a file): the
+    /// collector reads it as empty instead of failing.
+    #[test]
+    fn a_missing_blob_root_collects_nothing() {
+        let (_dir, store) = store();
+        let root = store.blobs().root().to_path_buf();
+        std::fs::remove_dir_all(&root).unwrap();
+        let report = collect(
+            &Backend::sqlite(store.clone()),
+            Duration::from_secs(DEFAULT_GRACE_SECS),
+            &mut |_| {},
+        );
+        assert_eq!(report.files_removed, 0, "{report:?}");
+    }
+
+    /// A stray file in the blob root is left alone: only fan-out
+    /// directories are walked, and the run does not fail on the one file
+    /// that fsck reports.
+    #[test]
+    fn a_stray_file_in_the_blob_root_is_left_alone() {
+        let (_dir, store) = store();
+        let root = store.blobs().root().to_path_buf();
+        let stray = root.join("stray.txt");
+        std::fs::write(&stray, b"not a blob\n").unwrap();
+        let report = collect(
+            &Backend::sqlite(store.clone()),
+            Duration::from_secs(DEFAULT_GRACE_SECS),
+            &mut |_| {},
+        );
+        assert_eq!(report.files_removed, 0, "{report:?}");
+        assert_eq!(
+            std::fs::read(&stray).unwrap(),
+            b"not a blob\n",
+            "the stray file was touched"
+        );
+    }
+
+    /// A row whose file is gone is dead at any age: the file grants
+    /// nothing, so the prune takes the row and the run does not fail.
+    #[test]
+    fn a_row_whose_file_is_gone_is_dead_at_any_age() {
+        let (_dir, store) = store();
+        let b = uploaded(&store, b"vanished\n");
+        let (_, path) = store.blobs().location(b);
+        std::fs::remove_file(&path).unwrap();
+        let report = collect(
+            &Backend::sqlite(store.clone()),
+            Duration::from_secs(DEFAULT_GRACE_SECS),
+            &mut |_| {},
+        );
+        assert_eq!(report.rows_pruned, 1, "{report:?}");
+        assert!(!named(&store, b));
+    }
+
+    /// A stored changeset whose body does not decode fails the run, and
+    /// the error names the changeset: the operator must know which row
+    /// is corrupt, not just that something is.
+    #[test]
+    fn a_corrupt_changeset_names_its_id() {
+        let (_dir, store) = store();
+        let b = uploaded(&store, b"corrupt\n");
+        store
+            .write(|c| {
+                let repo = c.repo_id(REPO)?;
+                c.insert_changeset(repo, &cs_put(b))
+            })
+            .unwrap();
+
+        // Corrupt the stored body in place: the id stays, the bytes lie.
+        let id = store
+            .read(|c| {
+                let repo = c.repo_id(REPO)?;
+                let ids = c.repo_changeset_ids(repo)?;
+                Ok(ids[0].clone())
+            })
+            .unwrap();
+        Backend::sqlite(store.clone())
+            .write(|c| {
+                c.sqlite()
+                    .unwrap()
+                    .execute(
+                        "UPDATE changesets SET body = X'00' WHERE id = ?1",
+                        rusqlite::params![id],
+                    )
+                    .map_err(crate::error::from_sqlite)?;
+                Ok(())
+            })
+            .unwrap();
+        let err = run(
+            &Backend::sqlite(store.clone()),
+            Duration::from_secs(DEFAULT_GRACE_SECS),
+            false,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        let hex = ChangesetId::try_from(id.as_slice()).unwrap().to_string();
+        assert!(
+            text.contains(&hex),
+            "the error must name the corrupt changeset {hex}: {text}"
+        );
+    }
+
+    /// An unreadable blob root fails the run: silence would tell the
+    /// operator there was nothing to collect while the disk stayed full.
+    #[test]
+    fn an_unreadable_blob_root_fails_the_run() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_dir, store) = store();
+        let root = store.blobs().root().to_path_buf();
+        let mode = std::fs::metadata(&root).unwrap().permissions();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let out = run(
+            &Backend::sqlite(store.clone()),
+            Duration::from_secs(DEFAULT_GRACE_SECS),
+            false,
+            &mut |_| {},
+        );
+        std::fs::set_permissions(&root, mode).unwrap();
+        assert!(out.is_err(), "the unreadable root was read as empty");
     }
 
     #[test]

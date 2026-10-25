@@ -87,7 +87,7 @@ else
   KILL_AT+=("$q" "$((q * 2))" "$((q * 3))")
 fi
 # The pg backend and its restart. Off by default; the nightly keeps it
-# off until the 72-hour hosting decision (D10) says where Postgres
+# off until the 72-hour hosting decision says where Postgres
 # lives. SCION_FAULT_PG_CMD is the restart command itself, for example
 # `docker restart soak-pg`.
 # The Postgres URL reaches every scion-server this script raises
@@ -341,6 +341,7 @@ pg_restart() {
   if [ -z "${SCION_FAULT_PG_CMD:-}" ]; then
     die "SCION_FAULT_PG=1 needs SCION_FAULT_PG_CMD"
   fi
+  PG_RESTARTS=$((PG_RESTARTS + 1))
   sh -c "$SCION_FAULT_PG_CMD" >> "$WORK/pg.log" 2>&1
   local n=0
   until pg_isready -q 2> /dev/null; do
@@ -356,6 +357,7 @@ note "fault-soaking for $RUN_MINUTES minutes, ${#KILL_AT[@]} kills"
 # (a du failure inside the loop must survive to the end: #561 review
 # F1 caught fail=0 reseting it after the loop).
 fail=0
+PG_RESTARTS=0
 mkdir -p "$WORK/read" "$WORK/cancel" "$WORK/ledger" "$WORK/seed"
 END=$(($(date +%s) + RUN_MINUTES * 60))
 T0=$(date +%s)
@@ -490,11 +492,19 @@ fi
 
 # The kills happened: one line per kill in restarts.csv, so a fault
 # loop that skipped one (a bug in the schedule or a swallowed signal)
-# is not a soak of fewer faults than the plan says (C50).
+# is not a soak of fewer faults than the plan says (the harness
+# vacuity audit of 2026-10-23).
 planned_kills=${#KILL_AT[@]}
 done_kills=$(wc -l < "$WORK/restarts.csv" | tr -d ' ')
 if [ "$done_kills" -ne "$planned_kills" ]; then
   echo "FAIL: $done_kills of $planned_kills planned kills happened" >&2
+  fail=1
+fi
+# A Postgres run that planned restarts but made none did not soak the
+# fault it was armed for: the summary row alone would show it, and
+# nothing would fail (a review finding of #585).
+if [ "${SCION_FAULT_PG:-0}" = "1" ] && [ "$PG_RESTARTS" -ne "$done_kills" ]; then
+  echo "FAIL: $PG_RESTARTS of $done_kills kills restarted Postgres" >&2
   fail=1
 fi
 
@@ -619,7 +629,7 @@ row "land requests served (counter)" "$landed"
 row "samples" "$rows"
 [ -n "$early" ] && row "p99 early -> late" "$early ms -> $late ms"
 # New rows go at the end of the summary (the owner's report template
-# reads the lines above; C50).
+# reads the lines above; the harness vacuity audit of 2026-10-23).
 row "kills planned -> done" "$planned_kills -> $done_kills"
 # The backend the run really served, from the data dir, against the
 # one the run asked for: the server runs Postgres when SCION_PG_URL is
@@ -634,6 +644,9 @@ if [ "$served" != "$asked_backend" ]; then
   echo "FAIL: asked for $asked_backend, the data dir says $served" >&2
   fail=1
 fi
+# The Postgres restarts this run made (0 on the SQLite backend; the
+# fault-soak-postgres job's summary shows the fault really ran).
+[ "${SCION_FAULT_PG:-0}" = "1" ] && row "postgres restarts" "$PG_RESTARTS"
 # A run shorter than the warm-up floor checks no per-segment RSS bound
 # and says so here: the floors the bounds need cannot exist, and the
 # no-sample exception above covers the same runs.

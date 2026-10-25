@@ -2,7 +2,7 @@
 
 How to cut a release of openscion. v0.1.x is a source release: one
 SSH-signed annotated git tag plus one immutable GitHub release with
-notes. Nothing publishes crates: the owner has decided (D12) that no
+notes. Nothing publishes crates: the owner has decided that no
 crate publishes before a real outside consumer exists, so a narrow
 client crate is the only publish ever planned. Nothing here tags by
 itself: each step is run by a person.
@@ -62,9 +62,16 @@ A release is cut through one PR from a branch named
    ```
 5. **A clean-checkout build and quick-start smoke.** From a fresh
    clone of the tagged commit, build the workspace and run the
-   README's `Try it` flow end to end.
-6. **The umask-002 run.** Once #302's CI job exists, it runs on the
-   release commit and its green result is part of the release.
+   README's `Try it` flow end to end. The tagged commit is also the
+   operator's source for the binaries (see `docs/operations.md`,
+   "Upgrades"): a source release says so in its notes (the binaries
+   build from this tag: `git checkout <tag>; cargo build --release
+   --locked`); a release that ships binaries says that instead. Either
+   way the notes point the operator at keeping the previous release's
+   binaries beside the new ones, because a rollback needs them.
+6. **The umask-002 run.** #302 is closed by choice: the group-writable
+   rule stays fail-closed and the refusal names the chmod, so the
+   release's umask-002 run proves the refusal, not an exception.
 7. **Benchmark numbers with their provenance.** A number that a
    release note states records the commit it measured, the OS, the
    filesystem, the dataset, the command, and the variance across runs.
@@ -74,7 +81,7 @@ A release is cut through one PR from a branch named
 
 1. **Tag, signed.** Cut an annotated tag from the commit that the
    release notes describe. The owner signs it personally with their SSH
-   key (D18), so the signature a verifier checks is the owner's, not a
+   key, so the signature a verifier checks is the owner's, not a
    CI secret's:
 
    ```sh
@@ -124,7 +131,7 @@ A release is cut through one PR from a branch named
    - **The registry the SBOMs name is not secret; nothing else to
      add.** The workflow needs no key: the tag's SSH signature is
      verified by GitHub at push time against the key on the owner's
-     account (D18), and the build signs nothing of its own — the
+     account, and the build signs nothing of its own — the
      provenance comes from GitHub's hosted builder.
 
    The dry-run proves all of it before the first tag: dispatch the

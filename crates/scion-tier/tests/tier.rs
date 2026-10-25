@@ -761,15 +761,7 @@ async fn each_tier_refuses_a_call_without_the_token() {
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.path().join("daemon.sock");
     let store = DiskStore::open(&dir.path().join("data"), 1 << 20).unwrap();
-    let daemon = Tier::new(
-        store,
-        &cache_url,
-        TOKEN,
-        CACHE_UPSTREAM_TIMEOUT,
-        None,
-        Vec::new(),
-    )
-    .unwrap();
+    let daemon = Tier::new_relay(store, &cache_url, TOKEN, CACHE_UPSTREAM_TIMEOUT, None).unwrap();
     let incoming = UnixListenerStream::new(bind_unix(&socket).await.unwrap());
     tokio::spawn(daemon.clone().serve(
         TOKEN,
@@ -1249,13 +1241,12 @@ async fn serve_daemon(
         client.map(|c| c.key.as_path()),
     )
     .unwrap();
-    let daemon = Tier::new(
+    let daemon = Tier::new_relay(
         store,
         cache_url,
         TOKEN,
         CACHE_UPSTREAM_TIMEOUT,
         Some(&client_tls),
-        Vec::new(),
     )
     .unwrap();
     let incoming = UnixListenerStream::new(bind_unix(&socket).await.unwrap());
@@ -1327,13 +1318,12 @@ async fn a_daemon_with_a_certificate_of_another_ca_is_refused() {
 #[tokio::test]
 async fn an_https_upstream_needs_a_ca() {
     let store = MemoryStore::new(1 << 20);
-    let tier = Tier::new(
+    let tier = Tier::new_relay(
         store,
         "https://127.0.0.1:1",
         TOKEN,
         CACHE_UPSTREAM_TIMEOUT,
         None,
-        Vec::new(),
     );
     assert!(tier.is_err());
 }
@@ -1352,15 +1342,7 @@ async fn a_daemon_miss_fetches_the_object_only() {
     let socket = dir.path().join("daemon.sock");
     let store = DiskStore::open(&dir.path().join("data"), 1 << 20).unwrap();
     // No ticket keys: a daemon, which checks no ticket and runs no walk.
-    let daemon = Tier::new(
-        store,
-        &cache_url,
-        TOKEN,
-        CACHE_UPSTREAM_TIMEOUT,
-        None,
-        Vec::new(),
-    )
-    .unwrap();
+    let daemon = Tier::new_relay(store, &cache_url, TOKEN, CACHE_UPSTREAM_TIMEOUT, None).unwrap();
     let incoming = UnixListenerStream::new(bind_unix(&socket).await.unwrap());
     tokio::spawn(daemon.clone().serve(
         TOKEN,
@@ -1517,15 +1499,7 @@ async fn a_daemons_cache_still_refuses_a_view_ticket_outside_its_view() {
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.path().join("daemon.sock");
     let store = DiskStore::open(&dir.path().join("data"), 1 << 20).unwrap();
-    let daemon = Tier::new(
-        store,
-        &cache_url,
-        TOKEN,
-        CACHE_UPSTREAM_TIMEOUT,
-        None,
-        Vec::new(),
-    )
-    .unwrap();
+    let daemon = Tier::new_relay(store, &cache_url, TOKEN, CACHE_UPSTREAM_TIMEOUT, None).unwrap();
     let incoming = UnixListenerStream::new(bind_unix(&socket).await.unwrap());
     tokio::spawn(daemon.clone().serve(
         TOKEN,
@@ -1630,6 +1604,11 @@ async fn a_daemon_killed_mid_fill_serves_no_torn_object_after_its_restart() {
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.path().join("daemon.sock");
     let data = dir.path().join("data");
+    // The daemon refuses a data directory that does not exist, and one
+    // that is open to other users; this test's store is a real one, so
+    // it exists and is private before the start.
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     let (mut child, url) = start_daemon(&data, &socket, &upstream, limit).await;
     let fill_task = spawn_get(&url, &fake, &fill).await;
@@ -1665,15 +1644,7 @@ async fn a_daemon_killed_mid_fill_serves_no_torn_object_after_its_restart() {
     // its own bytes: the copies that the kill cut arrive from upstream
     // again, and no torn file is served on the way (reads go on).
     let store = DiskStore::open(&data, limit).unwrap();
-    let restarted = Tier::new(
-        store,
-        &upstream,
-        TOKEN,
-        CACHE_UPSTREAM_TIMEOUT,
-        None,
-        Vec::new(),
-    )
-    .unwrap();
+    let restarted = Tier::new_relay(store, &upstream, TOKEN, CACHE_UPSTREAM_TIMEOUT, None).unwrap();
     let socket = dir.path().join("daemon-restarted.sock");
     let incoming = UnixListenerStream::new(bind_unix(&socket).await.unwrap());
     let serve_task = tokio::spawn(restarted.clone().serve(
@@ -1811,5 +1782,157 @@ fn agrees(store: &DiskStore, file: &(String, Vec<u8>, std::path::PathBuf, u64)) 
             .flatten()
             .is_some_and(|size| size as u64 == *len),
         Err(_) => false,
+    }
+}
+
+/// The daemon's stderr stays quiet and colorless across reads: no escape
+/// byte (color only when stderr is a terminal), and nothing per call (the
+/// `GetObjects` line is DEBUG; the hit and miss counts are the metrics'
+/// `cache_counts`). The 20 reads return their objects, so the quiet is
+/// not a broken daemon.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemons_stderr_stays_quiet_and_colorless_across_gets() {
+    use std::process::Command;
+    use std::time::Instant;
+
+    let object = blob(b"once per request is not a log level\n");
+    let fake = Fake::new(&[&object], Duration::ZERO);
+    let upstream = serve_fake(fake.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = dir.path().join("daemon.sock");
+    let log = dir.path().join("daemon.log");
+    let data = dir.path().join("data");
+    // The daemon refuses a data directory that does not exist (the
+    // accidental-data rule) and one whose mode is open to other users
+    // (the private-directory rule): the test makes it private, the way
+    // an operator would.
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_scion-daemon"))
+        .arg("--data")
+        .arg(&data)
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--upstream")
+        .arg(&upstream)
+        .arg("--max-bytes")
+        .arg((8 << 20).to_string())
+        .arg("--token")
+        .arg(TOKEN)
+        .arg("--upstream-token")
+        .arg(TOKEN)
+        // The caller's RUST_LOG must not steer the daemon's log filter:
+        // RUST_LOG=debug would bring the per-call line back, RUST_LOG=off
+        // would silence the check entirely.
+        .env_remove("RUST_LOG")
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .map(Kill)
+        .unwrap();
+    // The child is up when its socket file is there (10 s ceiling).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !socket.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never opened its socket"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let mut client = connect(&format!("unix://{}", socket.display()), Some(TOKEN)).await;
+
+    // One read, then measure what the daemon has logged.
+    get(&mut client, &fake, &[&object]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let after_one = std::fs::read(&log).unwrap().len();
+
+    // Nineteen more reads: a line per call would add about 19 lines.
+    for _ in 0..19 {
+        get(&mut client, &fake, &[&object]).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let bytes = std::fs::read(&log).unwrap();
+    assert!(
+        !bytes.contains(&0x1b),
+        "the daemon's stderr carries escape bytes: color is not a terminal's business"
+    );
+    let grew = bytes.len() - after_one;
+    assert!(
+        grew < 200,
+        "the daemon logged {grew} bytes across 19 reads: a line per call"
+    );
+    drop(child);
+}
+
+/// The cache verifies the ticket's signature on every call: an unsigned
+/// ticket, a ticket of a key the cache holds no public key for, and a
+/// valid ticket with one body byte flipped are all refused with the
+/// signature named, and nothing is served or fetched. The proof that
+/// binds the check to this tier: the refusal lives in this call site
+/// (`Tickets::Verify` -> `parse`), and a cache that reads its tickets
+/// unverified serves every one of these.
+#[tokio::test]
+async fn a_cache_refuses_a_ticket_that_no_key_of_its_signed() {
+    let secret = blob(b"the object a forged ticket must not reach\n");
+    let fake = Fake::new(&[&secret], Duration::ZERO);
+    let upstream = serve_fake(fake.clone()).await;
+    let (_cache, url) = serve_cache(&upstream, CACHE_UPSTREAM_TIMEOUT, &fake.keys()).await;
+    let mut caller = connect(&url, Some(TOKEN)).await;
+
+    // The body of a valid ticket for the object's tree, and its
+    // signature: the raw forms the three refusals are built from.
+    let signed = fake.ticket();
+    // The signature is 64 bytes (Ed25519); the parser refuses a body
+    // that is shorter, so the split at 64 is the real one.
+    let signature_bytes = 64_usize;
+    let (body, _) = signed.split_at(signed.len() - signature_bytes);
+
+    let unsigned = [body, &[0_u8; 64]].concat();
+    let status = get_with(&mut caller, vec![ref_for(&fake, &secret)], unsigned)
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+    assert!(status.message().contains("signature"), "{status:?}");
+
+    let stranger = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+    let wrong_key = scion_proto::ticket::sign(
+        &stranger,
+        "r",
+        "test",
+        *fake.root.as_bytes(),
+        scion_proto::ticket::now(),
+    )
+    .unwrap();
+    let status = get_with(&mut caller, vec![ref_for(&fake, &secret)], wrong_key)
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+    assert!(status.message().contains("signature"), "{status:?}");
+
+    let mut flipped = signed.clone();
+    // The body layout is version (1 byte), expiry (8), root tree (32),
+    // then the u16 length of the repo name. The flip hits the repo
+    // name's first byte: the length stays small and even, so the body
+    // still parses to exactly a repo, a principal and a root tree - the
+    // shape check cannot refuse it, and the signature is the only check
+    // left that can.
+    let at = 1 + 8 + 32 + 2;
+    flipped[at] ^= 0xff;
+    let status = get_with(&mut caller, vec![ref_for(&fake, &secret)], flipped)
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+    assert!(status.message().contains("signature"), "{status:?}");
+
+    assert_eq!(fake.calls(), 0, "nothing was fetched for any of the three");
+}
+
+/// The object ref at the fake's path for `object`, for a caller that
+/// brings its own ticket.
+fn ref_for(fake: &Fake, object: &Object) -> ObjectRef {
+    ObjectRef {
+        kind: object.kind,
+        id: object.id.clone(),
+        path: fake.path(object),
     }
 }

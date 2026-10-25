@@ -15,13 +15,19 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # The schedule runs in its own group. A concurrency group keeps one
+  # run in progress and at most one pending run, and a newer queued run
+  # replaces the pending one whatever cancel-in-progress says (GitHub
+  # docs, "Control the concurrency of workflows and jobs"): one group
+  # over the nightly and the pushes to main let any push replace a
+  # nightly that is waiting for the runner, and a busy day could keep
+  # the nightly waiting forever. A nightly that never ran is not a
+  # green night.
+  group: ${{ github.workflow }}-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
   # A pull_request run may cancel the run before it (same branch,
   # superseded); a push to main may not: a run in progress finishes
   # and verifies the head it ran on, and while it runs only the
-  # newest push waits — an older pending run is replaced, not run.
-  # A 03:00 schedule and a push to main share one group, and neither
-  # cancels: the nightly waits its turn.
+  # newest push waits - an older pending run is replaced, not run.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Every third-party action is pinned to the commit SHA its version tag
@@ -53,6 +59,8 @@ jobs:
       pg: ${{ steps.files.outputs.pg }}
       macos: ${{ steps.files.outputs.macos }}
       workflows: ${{ steps.files.outputs.workflows }}
+      deps: ${{ steps.files.outputs.deps }}
+      mount: ${{ steps.files.outputs.mount }}
     steps:
       - id: files
         env:
@@ -67,6 +75,8 @@ jobs:
           pg=false
           macos=false
           workflows=false
+          deps=false
+          mount=false
           while IFS= read -r line; do
             [ -z "$line" ] && continue
             status=${line%% *}
@@ -117,9 +127,39 @@ jobs:
             esac
             # Workflow or release files. The lint job's actionlint
             # step already runs for every pull request; the release
-            # smoke is the addition.
+            # smoke is the addition. A workflow change also runs the
+            # Postgres and macOS jobs: the workflows are how those
+            # jobs prove themselves, so a change to one runs the jobs
+            # it can break.
             case "$file" in
-              .github/workflows/*|scripts/release*) workflows=true ;;
+              .github/workflows/*|scripts/release*)
+                workflows=true
+                pg=true
+                macos=true
+                ;;
+            esac
+            # A dependency surface: any manifest, any lockfile (the
+            # root's or a fuzz workspace's), the deny configuration a
+            # lockfile is checked against, and the coverage script
+            # that keeps every lockfile checked. cargo-deny runs for
+            # the pull request that touches one, so an advisory or a
+            # bad license fails before the merge, not on main after it.
+            case "$file" in
+              Cargo.toml|*/Cargo.toml|\
+              Cargo.lock|*/Cargo.lock|\
+              deny.toml|*/deny.toml|\
+              scripts/check-deny-coverage.sh) deps=true ;;
+            esac
+            # The writable mount: its code lives in the VFS, the
+            # mount command and the commit's mount path. A pull request
+            # that touches one runs the feature's tests, so a PR cannot
+            # break the writable build for main to find out after the
+            # merge.
+            case "$file" in
+              crates/scn/src/vfs.rs|\
+              crates/scn/src/cmd/mount.rs|\
+              crates/scn/src/cmd/commit.rs|\
+              crates/scn/tests/from_mount.rs) mount=true ;;
             esac
           done <<< "$files"
           {
@@ -127,6 +167,8 @@ jobs:
             echo "pg=$pg"
             echo "macos=$macos"
             echo "workflows=$workflows"
+            echo "deps=$deps"
+            echo "mount=$mount"
           } >> "$GITHUB_OUTPUT"
 
   lint:
@@ -152,27 +194,37 @@ jobs:
       - name: the changelog takes fragments, not edits
         if: github.event_name == 'pull_request'
         run: scripts/check-changelog.sh
+      # Depth 2 feeds this too: the pull request's own change is
+      # HEAD^1..HEAD, so a golden re-pin must carry its format doc's
+      # version line in the same pull request.
+      - name: a golden change moves its format doc's version
+        if: github.event_name == 'pull_request'
+        run: scripts/check-golden-pairing.sh
       - name: the changelog merge script does what it says
         run: scripts/test-merge-changelog.sh
-      # The release pipeline's tag verdicts, fed canned tag objects: no
-      # CI run holds a signed release tag, so the decision is tested
-      # here instead of being trusted.
       - name: the release tag verdicts hold (release-verify-tag)
         run: scripts/test-release-verify-tag.sh
+      # The store-upgrade ladder's cap: 9 tags -> 8 kept + a warning
+      # naming the dropped ones. No store-upgrade run holds 9 tags
+      # today, so the decision is tested here on a fixture repo.
+      - name: the store ladder keeps the newest 8 and names the rest
+        run: scripts/test-store-upgrade-cap.sh
       # A workflow that cannot parse fails here, on the PR that carries
       # it, not main's next push-triggered run (#416, #419). The
       # actionlint release is pinned by version and sha256.
       - name: the workflows parse (actionlint)
         run: scripts/lint-workflows.sh
+      - name: the capacity reader counters count the log's own shapes
+        run: scripts/test-capacity-counters.sh
       - name: a script that dies leaves no owned process
         run: scripts/test-owned-run.sh
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # Save from main only. A pull request restores main's cache;
           # per-branch caches (66) blew past the 10 GB ceiling and evicted
@@ -180,6 +232,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The writable mount is a build feature, off by default: a
+      # PR that breaks the feature build must fail on the PR, not on
+      # main after the merge.
+      - run: cargo clippy -p open-scion --features unstable-writable-mount -- -D warnings
       # A release build has no dev-dependencies, so the test-hooks feature
       # stays off and every test-only item that a cfg misses shows up as
       # dead code. --all-targets unifies the dev-dependency that turns
@@ -189,8 +245,10 @@ jobs:
   docs:
     name: rustdoc
     needs: tier
-    # The docs tests run on every event and for every ready pull
-    # request; for a docs-only PR they are the only tier that runs.
+    # rustdoc runs on every event and for every ready pull request; for
+    # a docs-only PR it and the docs-tests job below are the only jobs
+    # that run. The docs tests are integration tests, not rustdoc, so
+    # they live in the separate docs-tests job below.
     if: >-
       ${{ !cancelled() && (needs.tier.result == 'success' || needs.tier.result == 'skipped') && !github.event.pull_request.draft }}
     runs-on: ubuntu-24.04
@@ -198,23 +256,71 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
+  docs-tests:
+    name: docs tests
+    needs: tier
+    # The docs tests (links, the changes fragments, flags, operations,
+    # alerts, capacity, the CLI help) are integration tests of the docs
+    # pages. The test job skips a docs-only pull request, so without
+    # this job a broken link or a stale doc would land and fail main's
+    # first run instead. The same if as the docs job: for a docs-only
+    # PR the two of them are the only jobs that run. The test targets
+    # come from the docs_*.rs files themselves, so a new docs test
+    # file runs without a hand list to forget; the counts refuse a
+    # glob that matched nothing, so a moved directory cannot turn the
+    # job into a no-op.
+    if: >-
+      ${{ !cancelled() && (needs.tier.result == 'success' || needs.tier.result == 'skipped') && !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: the docs tests
+        run: |
+          shopt -s nullglob
+          server_files=(crates/scion-server/tests/docs_*.rs)
+          cli_files=(crates/scn/tests/docs_*.rs)
+          if [ "${#server_files[@]}" -eq 0 ] || [ "${#cli_files[@]}" -eq 0 ]; then
+            echo "no docs_*.rs files found: the docs tests would run nothing"
+            exit 1
+          fi
+          server_args=()
+          for f in "${server_files[@]}"; do server_args+=(--test "$(basename "$f" .rs)"); done
+          cli_args=()
+          for f in "${cli_files[@]}"; do cli_args+=(--test "$(basename "$f" .rs)"); done
+          cargo test -p open-scion-server "${server_args[@]}"
+          cargo test -p open-scion "${cli_args[@]}"
+
   supply-chain:
     name: cargo-deny
-    # The slow tier: main, the nightly and a dispatch only.
-    if: github.event_name != 'pull_request'
+    needs: tier
+    # The slow tier: main, the nightly and a dispatch only -- plus a
+    # pull request that touches a dependency surface (a manifest, a
+    # lockfile, a deny.toml or the coverage script), so an advisory or
+    # a bad license fails on the pull request instead of on main after
+    # the merge. A draft skips every job, this one included.
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.deps == 'true')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-deny@0.20.2
       - run: cargo deny check
@@ -225,6 +331,16 @@ jobs:
       # root holds hold here too.
       - name: cargo deny check, in every fuzz sub-workspace
         run: |
+          # The lock check runs BEFORE cargo deny: cargo deny resolves a
+          # stale lock in place (its own resolution may write the
+          # lockfile), so a check after it would see the lock cargo deny
+          # already fixed, not the stale one the commit carried - the
+          # exact silent re-resolve this check exists to catch.
+          for toml in crates/*/fuzz/Cargo.toml; do
+            echo "== the lock matches the manifest in $(dirname "$toml")"
+            cargo metadata --locked --format-version 1 \
+              --manifest-path "$toml" > /dev/null
+          done
           for lock in crates/*/fuzz/Cargo.lock; do
             dir="$(dirname "$lock")"
             # Fail closed: cargo-deny only warns when its config is
@@ -253,10 +369,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-workspace-crates: true
@@ -265,6 +381,13 @@ jobs:
           # The fast tier: a pull request runs 500 cases, main, the
           # nightly and a dispatch the full 2000.
           PROPTEST_CASES: ${{ github.event_name == 'pull_request' && '500' || '2000' }}
+      # The daemon startup rules (#592's data-dir gate) are exercised by
+      # no per-PR job otherwise: the dispatch scripts (soak, bench,
+      # capacity, version-matrix) start the daemon, the suite does not.
+      # A few seconds: start the stack through common.sh, one call
+      # through the daemon, stop.
+      - name: the shell stack starts (server, cache, daemon)
+        run: scripts/start-scion-smoke.sh
       - name: the work tree is still clean after the tests
         run: |
           # A test that writes outside its sandbox (the #332 class) shows up
@@ -293,6 +416,60 @@ jobs:
           SCION_DMW_REQUIRE: "1"
           SCION_DMW_REPLAY: ${{ runner.temp }}/replay-log
 
+  test-restore-ceiling:
+    name: test (restore rss ceiling)
+    needs: tier
+    # The nightly, main and a dispatch only: the fixture is too much
+    # store for a shared machine's shared disk, the guard is release-shaped (a
+    # debug build's own baseline would eat the ceiling), and the
+    # measured peak lands in this job's log. The second step flips the
+    # replay's whole-file mutation lever and refuses a run where the
+    # mutated restore also passes, so the ceiling is never a guard a
+    # whole-history read slips under.
+    # The tier job is pull_request-shaped, so on a dispatch it is
+    # skipped: the ceiling runs anyway, the way lint does.
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request' && (needs.tier.result == 'success' || needs.tier.result == 'skipped')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-workspace-crates: true
+      - name: the streamed restore stays under its ceiling
+        run: cargo test --release -p open-scion-server --test archive_restore_stream a_big_restore -- --nocapture
+        env:
+          SCION_TEST_RESTORE_BIG: "1"
+      - name: the whole-file read would not (the guard is not vacuous)
+        # The mutated run must fail for THE CEILING's reason, not any
+        # reason: a compile error or a missing /proc would "fail" the
+        # same way and prove nothing. The output must carry the
+        # ceiling assert's own text - the mutated run measured a peak,
+        # and the peak passed the bound. Any other failure shows the
+        # output and fails the step.
+        run: |
+          if out=$(cargo test --release -p open-scion-server --test archive_restore_stream a_big_restore -- --nocapture 2>&1); then
+            echo "$out"
+            echo "::error::the whole-file mutation passed the ceiling: the guard is vacuous"
+            exit 1
+          fi
+          if ! printf '%s' "$out" | grep -q "passed the ceiling"; then
+            echo "$out"
+            echo "::error::the mutated run failed for a reason the ceiling did not name; the guard proves nothing"
+            exit 1
+          fi
+          printf '%s\n' "$out" | grep -oE "peak RSS \([0-9]+ kB\) passed the ceiling" | head -1
+          echo "the whole-file mutation blew the ceiling, as it must"
+        env:
+          SCION_TEST_RESTORE_BIG: "1"
+          SCION_TEST_RESTORE_MUTATION: "whole_file"
+
   # The Postgres majors the support matrix claims (docs/support.md):
   # one native service per major, one matrix row each. The majors are
   # the upstream-supported ones the project claims - checked against
@@ -316,9 +493,21 @@ jobs:
         # the tier rule above); the 16 and 18 cells are best effort and
         # run nightly and on a release candidate's dispatch.
         version: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && fromJSON('["16.15", "17.11", "18.6"]') || fromJSON('["17.11"]') }}
+        # The digest pins. A tag can move to new bytes; a digest cannot
+        # (production-audit.md section 9). Each include entry pins the
+        # multi-arch image index of its tag, fetched live from the
+        # registry (the runners are x64 and arm64; both are in the
+        # index). Bump a version together with its digest line.
+        include:
+          - version: 16.15
+            digest: 9e2cf6287f25c3151f4c9421ccce2b17f3e60061c111a29165e0d2cdd9ff0a97
+          - version: 17.11
+            digest: b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+          - version: 18.6
+            digest: edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6
     services:
       postgres:
-        image: postgres:${{ matrix.version }}
+        image: postgres:${{ matrix.version }}@sha256:${{ matrix.digest }}
         env:
           POSTGRES_PASSWORD: scion
           POSTGRES_DB: scion
@@ -332,10 +521,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-workspace-crates: true
@@ -392,12 +581,51 @@ jobs:
       # takes the database down while it runs.
       - name: the database may go down, and the store recovers
         run: |
-          container=$(docker ps --filter ancestor=postgres:${{ matrix.version }} --format '{{.Names}}' | head -1)
-          test -n "$container"
+          # The service container is found by its published port, never
+          # by the image reference: the image is pinned by digest, and
+          # a tag-shaped filter (ancestor=postgres:17.11) matches a
+          # digest-pinned container not at all. Exactly one container
+          # may publish 5432 on this runner; zero or two are a setup
+          # error the step names before any test runs.
+          names=$(docker ps --filter publish=5432 --format '{{.Names}}')
+          count=$(printf '%s\n' "$names" | grep -c . || true)
+          if [ "$count" -eq 0 ]; then
+            echo "::error::no container publishes 5432: the postgres service container is missing or did not start"
+            exit 1
+          fi
+          if [ "$count" -gt 1 ]; then
+            echo "::error::$count containers publish 5432: the takeover test cannot know which is the job's database ($names)"
+            exit 1
+          fi
+          container=$names
           SCION_TEST_PG_CONTAINER="$container" \
           SCION_TEST_BACKEND=postgres \
           SCION_TEST_POSTGRES_URL=postgres://postgres:scion@localhost:5432/scion \
           cargo test -p open-scion-server --test backend_refusals -- --ignored
+
+  test-writable:
+    name: test (the writable mount feature)
+    needs: tier
+    # Risk tier: a pull request that touches the mount's write path
+    # (the VFS, the mount command or the commit's mount path) also runs
+    # the feature's tests, so a PR cannot break the build that carries
+    # the write path. Main, the nightly and a dispatch always run it.
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' && needs.tier.outputs.mount == 'true')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The feature build's tests: the write-side unit tests of the VFS
+      # and the from-mount suite, which the default build compiles out.
+      - run: cargo test -p open-scion --features unstable-writable-mount
 
   test-macos:
     name: test (macOS)
@@ -412,10 +640,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-workspace-crates: true
@@ -479,10 +707,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo test --workspace
         env:
           PROPTEST_CASES: "2000"
@@ -507,10 +735,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: an xfs loop device for the stores
         run: |
           sudo apt-get update -qq
@@ -545,7 +773,7 @@ jobs:
       # the blob files take the cuts, the metadata sits in the database's
       # own WAL, and the run proves the store reads what the cut left.
       postgres:
-        image: postgres:17.11
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
         env:
           POSTGRES_PASSWORD: scion
           POSTGRES_DB: scion
@@ -561,14 +789,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: cache the LazyFS build
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ${{ runner.temp }}/lazyfs/lazyfs/build
@@ -617,7 +845,7 @@ jobs:
       # says what the cut actually persisted.
       - name: upload the LazyFS trace
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: lazyfs-trace
           path: |
@@ -627,8 +855,13 @@ jobs:
 
   nfs-mount:
     name: mount (NFS)
-    # The slow tier: main, the nightly and a dispatch only.
-    if: github.event_name != 'pull_request'
+    needs: tier
+    # The slow tier: main, the nightly, a dispatch, and a pull request
+    # whose files the mount's code touches (the tier output `mount`):
+    # a PR that changes the mount must face the NFS mount, not leave
+    # it for main to find out after the merge.
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.mount == 'true')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
@@ -636,7 +869,7 @@ jobs:
       # the marker and the blob files sit on the NFS mount, the metadata
       # sits in the database, and the run proves the mount of that half.
       postgres:
-        image: postgres:17.11
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
         env:
           POSTGRES_PASSWORD: scion
           POSTGRES_DB: scion
@@ -650,10 +883,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: the kernel NFS client
@@ -680,7 +913,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc
       # One invocation, in dependency order: cargo resolves a packaged
@@ -699,10 +932,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@360a4e93673de6630fac2478bc9e35244b01a759 # 1.88, the MSRV: do not move
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo +1.88 check --locked --workspace --all-targets --all-features
@@ -716,10 +949,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --release -p open-scion-server
@@ -740,8 +973,8 @@ jobs:
       # The layer cache holds the release build: the first run takes about
       # five minutes, a run after an ordinary push about one. The cache
       # export needs the container driver, not the default docker one.
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           load: true
@@ -762,10 +995,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: |
             crates/scion-core/fuzz
@@ -773,7 +1006,7 @@ jobs:
             crates/scion-server/fuzz
             crates/scion-tier/fuzz
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-fuzz
       - name: fuzz the parsers
@@ -818,10 +1051,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # The README quick start on the release binaries, twice (umask 022

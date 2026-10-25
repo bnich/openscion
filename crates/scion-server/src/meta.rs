@@ -523,6 +523,12 @@ pub trait MetaTx {
     /// per statement.
     fn stored_changeset_bodies(&mut self, ids: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
 
+    /// The length of the stored body of every id that has one, as
+    /// `(id, length)`: the gc's prune sizes its body chunks from the
+    /// lengths before it fetches any body, so a chunk's memory is the
+    /// byte budget plus one body, not the whole batch.
+    fn stored_changeset_body_lengths(&mut self, ids: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, i64)>>;
+
     /// The blobs that `repo` may name, all of them.
     fn repo_blob_ids(&mut self, repo: RepoId) -> Result<Vec<Vec<u8>>>;
 
@@ -559,6 +565,12 @@ pub trait MetaTx {
 
     /// Whether any repo names `blob`.
     fn any_repo_names(&mut self, blob: &[u8]) -> Result<bool>;
+
+    /// The repos whose `repo_blobs` row names `blob`, so the dry run's
+    /// sweep can subtract the pairs its prune would remove: the real run
+    /// deletes those rows before it sweeps, and the dry run must report
+    /// the same files. Same shape as `any_repo_names`.
+    fn repos_naming(&mut self, blob: &[u8]) -> Result<Vec<RepoId>>;
 
     /// The `(changeset ID, body)` of the changesets after `from`, in ID
     /// order, at most `limit`. `fsck`'s walk over every stored changeset.
@@ -604,6 +616,14 @@ pub trait MetaTx {
         cs: &[u8],
         limit: usize,
     ) -> Result<Vec<FsckDerivedRow>>;
+
+    /// Removes the restore's staging mark, in the caller's transaction.
+    /// Publication is atomic with this: a store that answers reads
+    /// never carries the mark a later restore would drop it by.
+    /// # Errors
+    ///
+    /// A database error.
+    fn clear_restore_mark(&mut self) -> Result<()>;
 }
 
 /// The row ID of a repository, private to the backend.

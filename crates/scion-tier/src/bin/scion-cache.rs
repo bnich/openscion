@@ -2,6 +2,7 @@
 //! `scion-cache`: a regional cache tier. Serves the `Objects` calls from
 //! memory and fetches misses from its upstream, the server.
 
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::os::unix::fs::DirBuilderExt as _;
@@ -74,9 +75,10 @@ struct Cli {
     upstream_token_file: Option<PathBuf>,
     /// The public keys (64 hex characters, from `scion-server ticket-key`)
     /// that a ticket of a call must verify against. One is enough; a
-    /// second keeps the old key alive during a rotation. Without one, no
-    /// object is served.
-    #[arg(long, value_name = "HEX")]
+    /// second keeps the old key alive during a rotation. The cache
+    /// refuses to start without one: a tier that checks no ticket would
+    /// serve every object it holds to any caller.
+    #[arg(long, value_name = "HEX", required = true)]
     ticket_public_key: Vec<String>,
     /// Most connections served at once. More clients wait until one closes.
     #[arg(long, default_value_t = listen::DEFAULT_CONNECTIONS)]
@@ -185,8 +187,11 @@ fn secret_of(
 async fn main() -> anyhow::Result<()> {
     // Logs go to stderr: stdout may carry command output that callers
     // capture with $(...).
+    // Color only when stderr is a terminal: a file or a pipe is a log
+    // to keep, and escape bytes in it are noise on every line.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();

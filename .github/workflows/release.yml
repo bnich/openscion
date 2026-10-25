@@ -6,7 +6,7 @@ name: release
 # dry-run (workflow_dispatch) runs everything but the publish, on an
 # unsigned tag name, so the whole pipeline is provable before the first
 # real tag. It never runs on pull_request, and nothing goes to
-# crates.io (D12).
+# crates.io (releases are source-only by the owner's decision).
 
 on:
   push:
@@ -83,7 +83,7 @@ jobs:
           fi
           tag="$RELEASE_TAG"
           # An annotated tag only: a lightweight tag has no tag object,
-          # so it cannot carry a signature (D18).
+          # so it cannot carry a signature (the owner signs the tag).
           gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" \
             > ref-answer.json
           [ "$(jq -r .object.type ref-answer.json)" = tag ] || {
@@ -145,10 +145,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: ${{ env.PROTOC_SPEC }}
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: ${{ env.CYCLONEDX_SPEC }}
       - name: The epoch is the tag commit's time; the paths are remapped

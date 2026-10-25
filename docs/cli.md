@@ -5,9 +5,27 @@ over gRPC, prints human-readable text by default, and takes `--json` for
 machine-readable output. An error exits 2; `0` is success and `1` is the
 "no" of `scn is-ancestor`.
 
+## Names and messages in JSON
+
+A path, a file name, an author name or email, and a changeset message
+hold raw bytes, which need not be valid UTF-8. In `--json` output every
+such field keeps its lossy text (an invalid byte prints as U+FFFD), and
+a field whose bytes are not valid UTF-8 carries the exact bytes beside
+it in a sibling field named `<field>_b64`: standard base64, with
+padding. A value that is valid UTF-8 prints as before, with no sibling
+field. The human output stays the lossy text; the JSON is the channel
+that round-trips the bytes.
+
 ## Global flags and environment variables
 
-Every command takes these flags, before or after the subcommand:
+Every command takes the connection flags (`--server`, `--objects`,
+`--tls-ca`, `--repo`, `--json`) before or after the subcommand. The two
+token flags sit before the subcommand only (they are flags of `scn`
+itself): `scn --token-file FILE cat main:src/lib.rs` parses;
+`scn cat --token-file FILE ...` does not. The server's own global flags
+(`--data`, `--postgres-url`, `--postgres-url-file`, `--postgres-ca`)
+also parse before or after its subcommand: `scion-server --data D fsck`
+and `scion-server fsck --data D` are the same call.
 
 | Flag | Environment | Default | Meaning |
 |---|---|---|---|
@@ -56,7 +74,11 @@ Every command takes these flags, before or after the subcommand:
   The mount is read-only: every write is answered `EROFS`. With
   `--unstable-writable` it takes writes into its overlay — unstable,
   because a symlinked parent directory in the overlay can still
-  redirect a write outside it.
+  redirect a write outside it. The write path is a build feature,
+  `unstable-writable-mount`, off by default: a default or release build
+  refuses the flag by name (`this build has no writable mount: it was
+  built without the unstable-writable-mount feature`) and has no write
+  path at all ([stability.md](stability.md)).
   `scn unmount DIR` stops the mount.
 - `scn commit --message MESSAGE` (`-m`) — create a changeset on the server. It moves no
   ref; use `scn land` next. `--base REV` is the base (default `main`);
@@ -69,6 +91,9 @@ Every command takes these flags, before or after the subcommand:
   and `--delete`; it commits what the overlay holds at that moment, so a
   commit while a file of the mount is still being written records the
   bytes written so far, the way `git add` does on a file being saved.
+  Like the writable mount, it exists only in a build with the
+  `unstable-writable-mount` feature; a default or release build refuses
+  it by name.
 - `scn land CHANGESET` — rebase a changeset onto a ref and move the ref
   (`--onto`, default `main`). `--request-id KEY` is the retry key; it
   defaults to the changeset ID and ref, so a retry of the same land is

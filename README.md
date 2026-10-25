@@ -44,8 +44,9 @@ the build attestations, the SBOM: [docs/verify.md](docs/verify.md).
 **Interface.** openscion is a command-line tool and a service, and its
 interface is text: commands, plain files, and log lines. That is the
 accessibility surface this project supports. Human output may change
-between releases; `--json` output is the stable form for scripts and
-assistive tools ([docs/stability.md](docs/stability.md)).
+between releases; `--json` output is the machine-readable form for scripts
+and assistive tools (what it promises per release:
+[docs/stability.md](docs/stability.md)).
 
 What each severity level gets and for how long:
 [docs/support.md](docs/support.md).
@@ -54,9 +55,11 @@ What each severity level gets and for how long:
 describes a horizontally scalable system: a small fleet of servers that need
 little coordination, with metadata in Spanner and file contents in blob
 storage, and a cache tier per region and a daemon per node in front of them.
-Here, all data is in one SQLite file and one blob folder on one machine, all
-writes go through one database connection, and lands to a ref are serialized
-by a lock in the server's memory. So a second server process cannot share the
+Here, one server process holds everything: metadata in one SQLite file (or,
+experimentally, a Postgres database) plus one blob folder on one machine,
+all writes go through one connection to that store, and lands to a ref are
+serialized by a lock in the server's memory. So a second server process
+cannot share the
 data. A backend that scales out is not built
 ([#47](https://github.com/bnsd55/openscion/issues/47)); the cache tiers are
 built and run in front of the server (below).
@@ -135,20 +138,22 @@ cover and cannot write; the server derives a view of the repo for it.
 numbers, and removes what it made. The method and the checkout
 benchmark against git are in [docs/benchmarks.md](https://github.com/bnsd55/openscion/blob/main/docs/benchmarks.md).
 
-The steps below want a git repository with a `src/` folder and a
-`README.md`. Get one:
+The steps below want a git repository with a `README.md` and code under
+a `tokio/src/` folder (tokio is a workspace; its library lives in
+`tokio/src`). Get one:
 
 ```sh
 git clone https://github.com/tokio-rs/tokio /tmp/tokio
 git -C /tmp/tokio checkout be689a35f5ade5a39e507f79d3ec85cdab27806f
 ```
 
-(any git repository with those two works). Every line below runs as
-written.
+(another repository works if you change the paths below to its own;
+with tokio, every line runs as written).
 
 ```sh
 cargo build --release
 export SCION_TOKEN=dev SCION_SERVER=http://127.0.0.1:7878
+install -d -m 0700 /tmp/scion
 ./target/release/scion-server --data /tmp/scion import /tmp/tokio
 ./target/release/scion-server --data /tmp/scion ticket-key --out /tmp/scion/ticket.key > /tmp/scion/ticket.pub
 # the public key is now in ticket.pub; pass it to the tiers below
@@ -156,19 +161,19 @@ export SCION_TOKEN=dev SCION_SERVER=http://127.0.0.1:7878
 ./target/release/scion-server --data /tmp/scion fsck              # check the data directory; safe while the server runs
 ./target/release/scion-server --data /tmp/scion gc --dry-run      # what a collection would remove; safe while the server runs
 
-./target/release/scn ls main:src                    # mode, kind, size, name per entry
+./target/release/scn ls main:tokio/src            # mode, kind, size, name per entry
 ./target/release/scn log -n 5
-./target/release/scn log --path src -n 5            # changesets that changed src/
+./target/release/scn log --path tokio/src -n 5    # changesets that changed tokio/src/
 ./target/release/scn blame main:README.md
 ./target/release/scn cat main:README.md
-./target/release/scn checkout main --into /tmp/work # --sparse DIR for part of it
+./target/release/scn checkout main --into /tmp/work # --sparse tokio/src for part of it
 mkdir -p /tmp/view
 # The mount serves NFS from scn itself and holds this terminal: run it
 # in another terminal, and leave it there until `scn unmount`. On macOS
 # it runs `sudo mount_nfs`, so it asks for your password once.
 ./target/release/scn mount /tmp/view main           # files load when first read
-# The mount is read-only, so this commit is refused until you mount
-# with `--unstable-writable` (see below); the refusal names the flag.
+# The mount is read-only, and this release build has no writable mount:
+# this commit is refused, and the refusal names the flag (see below).
 ./target/release/scn commit -m "from the mount" --from-mount /tmp/view
 ./target/release/scn unmount /tmp/view
 echo hello > hello.txt
@@ -189,10 +194,12 @@ it is first read, not when the checkout starts. It holds the terminal it
 runs in until `scn unmount` stops it, and on macOS it runs `sudo
 mount_nfs`, so it asks for your password once. In v0.1 the mount is
 read-only: every write is answered `EROFS`, and `scn commit --from-mount`
-refuses, because a symlinked parent directory in the overlay can still
-redirect a write outside it. `scn mount --unstable-writable` takes writes
-into a private overlay directory, and `scn commit --from-mount DIR`
-commits exactly what
+refuses. The write path is a build feature (`unstable-writable-mount`),
+off by default and out of release builds: a build without it refuses
+`--unstable-writable` by name, because a symlinked parent directory in
+the overlay can still redirect a write outside it. A build with the
+feature takes writes into a private overlay directory, and `scn commit
+--from-mount DIR` commits exactly what
 the mount holds. It is for single-user machines only: any local user who
 can read the mount table can reach the mounted content through the NFS
 port. `scn unmount DIR` stops it and removes the overlay.
@@ -313,8 +320,9 @@ lives there. Each directory above it must be owned by root or by you, and
 must not be writable by group or others unless it has the sticky bit (as
 `/tmp` has). `scn` checks the same for the socket. The error names the
 directory; `chmod go-w DIR` fixes it. With umask 002 (a private group per
-user), new directories are group-writable, so they are refused until you run
-that. Stop the daemon with Ctrl-C or SIGTERM: it then writes its index, and
+user), a plain mkdir makes a group-writable directory, and it is refused by
+choice (the rule stays fail-closed). Make the directory with
+`install -d -m 0700 DIR`, or run `chmod g-w DIR`. Stop the daemon with Ctrl-C or SIGTERM: it then writes its index, and
 its next start reads that one file instead of every stored object.
 
 A regional cache can also write snapshots, so that a new node's daemon does
@@ -400,6 +408,7 @@ A bearer token over plain TCP to a non-loopback address stays refused.
 | [`docs/format-v1.md`](https://github.com/bnsd55/openscion/blob/main/docs/format-v1.md) | The v1 byte format. Object IDs are hashes of these bytes. |
 | [`docs/protocol-v1.md`](https://github.com/bnsd55/openscion/blob/main/docs/protocol-v1.md) | The v1 API contract: calls, limits, status codes, retries, durability and what a client checks |
 | [`docs/cli.md`](https://github.com/bnsd55/openscion/blob/main/docs/cli.md) | Every `scn` command: what it does, its flags, the global flags and env vars, and the exit codes |
+| [`docs/cli-vs-git.md`](https://github.com/bnsd55/openscion/blob/main/docs/cli-vs-git.md) | Every `scn` command next to the closest `git` and `gh` operation, and the differences that matter for a reader arriving from a GitHub workflow |
 | [`docs/operations.md`](https://github.com/bnsd55/openscion/blob/main/docs/operations.md) | How to run a server: deploy, keys, the access file, Postgres, backups, and what each failure means |
 | [`docs/threat-model.md`](https://github.com/bnsd55/openscion/blob/main/docs/threat-model.md) | The supported profile, the assets, the actors, the trust boundaries, and each security invariant with the test that proves it |
 | [`docs/faults.md`](https://github.com/bnsd55/openscion/blob/main/docs/faults.md) | One row per fault: what the client sees, what the operator sees, what survives a restart, and the test that proves it |
@@ -436,7 +445,8 @@ here. Every job is in [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 | Where | Runner, architecture | What runs there |
 |---|---|---|
-| Ubuntu 24.04, x86-64 | GitHub's `ubuntu-24.04` image, Linux 6.x, ext4 | All 15 CI jobs: the lint and doc jobs, `test`, the tmpfs disk-full test, block-level power cuts (dm-log-writes), the Postgres suite, the power-loss suite on LazyFS 0.3.1, the mount (NFS) job through the kernel's NFS client, the demo in Docker, the fuzz smoke on `x86_64-unknown-linux-gnu`, the release smoke of the README quick start, and `publish check` |
+| Ubuntu 24.04, x86-64 | GitHub's `ubuntu-24.04` image, Linux 6.x, ext4 | Every Linux x86-64 CI job: the lint, doc and supply-chain jobs, `test`, the tmpfs disk-full test, block-level power cuts (dm-log-writes), the Postgres suite, the power-loss suite on LazyFS 0.3.1, the mount (NFS) job through the kernel's NFS client, the restore-RSS-ceiling and writable-mount-feature tests, the XFS cell, the demo in Docker, the fuzz smoke on `x86_64-unknown-linux-gnu`, the release smoke of the README quick start, and `publish check` |
+| Ubuntu 24.04, arm64 | GitHub's `ubuntu-24.04-arm` image | `test (linux arm64)`: the whole workspace suite plus a real disk-full run on tmpfs; best effort until v0.8 — the nightly and a release candidate's dispatch prove the arm64 cells, a push does not |
 | macOS 15, Apple Silicon (arm64) | GitHub's `macos-15` image, APFS | `test (macOS)`: the whole test suite; `release smoke (macos-15)`: the README quick start on release binaries |
 
 The macOS row carries its repetition evidence: after PR
@@ -445,11 +455,13 @@ and commit tests that fork passed 100 runs in a row on macos-15 ([the
 mount-reps
 run](https://github.com/bnsd55/openscion/actions/runs/39310255775)).
 
-PostgreSQL 17.11 (`postgres:17.11`) is the version the Postgres job tests;
-it is the only version CI exercises, and other server versions are untested.
-The release builds target x86-64 Linux; macOS runs the same suite from
-source. The toolchain floor is Rust 1.88 (`rust-version`, checked by the
-`check (MSRV)` job).
+PostgreSQL 17.11 (`postgres:17.11`) is the version the Postgres job runs
+per push; the nightly and the release-candidate dispatch also run 16.15
+and 18.6, and every Postgres cell is experimental in v0.1.0. The release
+workflow builds and smoke-tests binaries for x86-64 Linux and Apple
+Silicon macOS; v0.1.0 itself is a source release (docs/RELEASING.md).
+The toolchain
+floor is Rust 1.88 (`rust-version`, checked by the `check (MSRV)` job).
 
 Not supported, or tested only in parts:
 
@@ -467,16 +479,28 @@ Not supported, or tested only in parts:
 - **`scn mount`**: single-user machines only, by design: the kernel's NFS
   client reaches it as any local user ([#11](https://github.com/bnsd55/openscion/issues/11)).
 
-The CI jobs: `fmt + clippy`, `rustdoc`, `cargo-deny`, `test` (with the
-tmpfs disk-full and dm-log-writes steps), `test (postgres)` (Postgres
-17.11), `test (macOS)`, `power-loss` (LazyFS), `mount (NFS)`, `check
-(MSRV)` (Rust 1.88), `conformance (grpcurl)`, `docker demo`, `fuzz smoke`,
-`release smoke` (ubuntu-24.04 and macos-15) and `publish check`.
+Every CI job, with its trigger, is in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml). The named ones:
+`fmt + clippy`, `rustdoc`, the docs tests (including the link test),
+`cargo-deny`, `test` (with the tmpfs disk-full and dm-log-writes steps),
+`test (postgres)`, `test (restore rss ceiling)`, `test (the writable
+mount feature)`, `test (linux arm64)`, `test (xfs)`, `promtool`, `test
+(macOS)`, `power-loss` (LazyFS 0.3.1), `mount (NFS)`, `check (MSRV)`
+(Rust 1.88), `conformance (grpcurl)`, `docker demo`, `fuzz smoke` (60 s),
+`release smoke` (ubuntu-24.04 and macos-15), `publish check`, and the
+nightly streak.
 
 ## Build and test
 
 Requires Rust 1.88 or newer and `protoc` (the Protocol Buffers compiler; for
 example `brew install protobuf` or `apt install protobuf-compiler`).
+
+v0.1.0 is a source release: the binaries of a version build from its
+signed tag (`git checkout <tag>; cargo build --release --locked`). A
+release that ships binaries says so in its release notes, and
+`docs/verify.md` verifies them. An operator upgrading keeps the previous
+release's binaries beside the new ones: a rollback needs them
+(`docs/operations.md`, "Upgrades").
 
 ```sh
 cargo test --workspace

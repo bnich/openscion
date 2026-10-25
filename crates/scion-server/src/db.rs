@@ -1355,6 +1355,26 @@ impl MetaTx for SqliteTx<'_> {
         Ok(rows)
     }
 
+    /// The stored length of every id's body. SQLite holds bodies as
+    /// BLOBs, so `length` counts bytes.
+    fn stored_changeset_body_lengths(&mut self, ids: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, i64)>> {
+        let mut rows = Vec::new();
+        let mut stmt = self
+            .0
+            .prepare_cached("SELECT id, length(body) FROM changesets WHERE id = ?1")
+            .map_err(crate::error::from_sqlite)?;
+        for id in ids {
+            if let Some(len) = stmt
+                .query_row(params![id], |row| row.get(1))
+                .optional()
+                .map_err(crate::error::from_sqlite)?
+            {
+                rows.push((id.clone(), len));
+            }
+        }
+        Ok(rows)
+    }
+
     /// The blobs that `repo` may name, all of them.
     fn repo_blob_ids(&mut self, repo: RepoId) -> Result<Vec<Vec<u8>>> {
         let mut stmt = self
@@ -1401,6 +1421,28 @@ impl MetaTx for SqliteTx<'_> {
             .map_err(crate::error::from_sqlite)?
             .exists(params![blob])
             .map_err(crate::error::from_sqlite)
+    }
+
+    /// The repos whose `repo_blobs` row names `blob`. The dry run's sweep
+    /// needs the names, not just whether there is one: the pairs its prune
+    /// would remove must not count (the real run deletes them before the
+    /// sweep; the dry run keeps them, and the sweep subtracts them here).
+    /// Same shape as `any_repo_names`: one probe per repo.
+    fn repos_naming(&mut self, blob: &[u8]) -> Result<Vec<RepoId>> {
+        let mut stmt = self
+            .0
+            .prepare_cached(
+                "SELECT r.repo_id FROM repos r
+                 WHERE EXISTS (SELECT 1 FROM repo_blobs rb
+                               WHERE rb.repo_id = r.repo_id AND rb.blob = ?1)
+                 ORDER BY r.repo_id",
+            )
+            .map_err(crate::error::from_sqlite)?;
+        let rows = stmt
+            .query_map(params![blob], |row| row.get(0))
+            .map_err(crate::error::from_sqlite)?;
+        rows.map(|row| row.map(RepoId).map_err(crate::error::from_sqlite))
+            .collect()
     }
 
     /// The `(changeset ID, body)` of the changesets after `from`, in ID
@@ -1574,6 +1616,11 @@ impl MetaTx for SqliteTx<'_> {
             .map_err(crate::error::from_sqlite)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(crate::error::from_sqlite)
+    }
+
+    fn clear_restore_mark(&mut self) -> Result<()> {
+        // SQLite has no restore staging mark: the mark is Postgres's.
+        Ok(())
     }
 }
 /// Commit graphs for tests.

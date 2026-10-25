@@ -88,6 +88,7 @@ pub(crate) mod objects;
 mod pg;
 pub(crate) mod quotas;
 pub(crate) mod read;
+pub(crate) mod reply;
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) mod seed;
 pub(crate) mod service;
@@ -139,6 +140,14 @@ pub mod test_support {
         #[allow(unreachable_pub)]
         pub fn read_changesets(path: &Path) -> crate::error::Result<Changesets> {
             crate::archive::read_changesets(path)
+        }
+
+        /// The transactions the restores of this process committed so
+        /// far: a test that must see a restore commit many transactions
+        /// reads it before and after.
+        #[allow(unreachable_pub)]
+        pub fn restore_tx_count() -> u64 {
+            crate::archive::RESTORE_TXS.load(std::sync::atomic::Ordering::Relaxed)
         }
 
         /// Reads the blob members of `path`.
@@ -314,6 +323,7 @@ pub use history::{PathHistory, backfill_path_history};
 pub use import::set_import_per_commit_txs;
 pub use import::{ImportOptions, ImportReport, import_git};
 pub use quotas::Quotas;
+pub use reply::REPLY_MEMORY_BUDGET;
 pub use scion_proto::runtime::metrics::Metrics;
 pub use service::{ServeOptions, serve};
 // `ServeOptions` is public and holds the audit handle, so the handle is

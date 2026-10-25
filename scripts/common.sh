@@ -60,6 +60,19 @@ need() {
   [ -x /usr/bin/time ] || die "needs /usr/bin/time (Debian, Ubuntu: apt install time)"
 }
 
+# kib_per_1k START END LANDS: the growth in KiB per 1,000 lands, from
+# the lands that actually happened, not the lands a plan asked for.
+# A cell whose counter grew by 0 has no per-land growth: it prints "-"
+# rather than a division by zero or a number the plan invented.
+kib_per_1k() {
+  local start=$1 end=$2 lands=$3
+  if [ "$lands" -gt 0 ]; then
+    echo $(( (end - start) * 1000 / lands ))
+  else
+    echo "-"
+  fi
+}
+
 # served_backend DATA_DIR: what the store the server ran on really is,
 # read from the data directory. backend.rs writes the `backend` marker
 # only for Postgres, so no marker file means SQLite; a marker file with
@@ -153,6 +166,9 @@ fetch_dataset() {
 # sets $COMMITS. Its times are in $WORK/import.log.
 import_dataset() {
   note "importing"
+  # The server refuses a missing data directory (#578); create it here.
+  mkdir -p "$WORK/server"
+  chmod 700 "$WORK/server"
   /usr/bin/time -p "$BIN/scion-server" --data "$WORK/server" import --rev main "$WORK/src.git" \
     > "$WORK/import.out" 2> "$WORK/import.log" || {
     tail -n 20 "$WORK/import.log" >&2
@@ -411,8 +427,35 @@ start_scion() {
     --upstream "$SERVER" \
     --ticket-public-key "$(cat "$WORK/ticket.pub")" \
     --metrics-listen "127.0.0.1:$CACHE_METRICS_PORT"
+  mkdir -p "$WORK/daemon"
+  # The daemon refuses a data directory open to other users (its socket
+  # and store live there); the scripts run alone in $WORK, so 0700.
+  chmod 700 "$WORK/daemon"
   start daemon serving "$BIN/scion-daemon" --data "$WORK/daemon" --socket "$SOCKET" \
     --upstream "http://127.0.0.1:$CACHE_PORT"
+}
+
+# cell_throughput BENCH_JSONS: the cell's throughput, the lands the
+# bench reports over the seconds its reports cover, summed over the
+# cell's reps. A rep whose bench died leaves no report and adds no
+# lands or seconds. test-capacity-counters.sh pins the arithmetic: the
+# seconds are the reports' SECOND field - summing the lands field read
+# 1.0 lands/s in every cell of run 40206407822.
+cell_throughput() {
+  local bf lands=0 secs=0 tsv
+  tsv=$(mktemp)
+  for bf in "$@"; do
+    [ -f "$bf" ] || continue
+    jq -r '[.landed // 0, .seconds // 0] | @tsv' "$bf" > "$tsv" || continue
+    lands=$((lands + $(cut -f1 "$tsv")))
+    secs=$(awk -v s="$secs" '{ print s + $2 }' "$tsv")
+  done
+  rm -f "$tsv"
+  if awk -v s="$secs" 'BEGIN { exit !(s > 0) }'; then
+    awk -v l="$lands" -v s="$secs" 'BEGIN { printf "%.1f\n", l / s }'
+  else
+    echo "-"
+  fi
 }
 
 # scrape_metrics URL: the total of the out-bytes counters of the registry at
@@ -580,4 +623,16 @@ cpu() { awk '($1 == "user" || $1 == "sys") && NF == 2 { s += $2 } END { printf "
 # the find(1) tests.
 file_bytes() {
   find "$@" -type f -exec wc -c {} + | awk '$2 != "total" { s += $1 } END { print s + 0 }'
+}
+
+# The reader log's outcome counts: the lines the reader loop writes name
+# their event, but not at the line's start, so the greps match the event
+# text anywhere in the line.
+count_reader_timeouts() {
+  [ -f "$1" ] || { echo 0; return; }
+  grep -c "timeout after 60s" "$1" || true
+}
+count_reader_failures() {
+  [ -f "$1" ] || { echo 0; return; }
+  grep -c "checkout failed rc=" "$1" || true
 }
