@@ -410,8 +410,8 @@ fn restore_sampled(archive: &std::path::Path, target: &std::path::Path) -> u64 {
     assert_eq!(peaks.len(), 1, "the child named its peak once: {stdout}");
     // A peak line that does not parse is a bug in the seam, not a
     // small process: fail loudly instead of measuring zero.
-    peaks[0]
-        .trim()
+    let peak_text = peaks[0].trim();
+    peak_text
         .parse()
-        .unwrap_or_else(|e| panic!("the child's peak line does not parse: {peaks[0]:?}: {e}"))
+        .unwrap_or_else(|e| panic!("the child's peak line does not parse: {peak_text:?}: {e}"))
 }
