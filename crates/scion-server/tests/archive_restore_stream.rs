@@ -213,6 +213,12 @@ fn a_big_restore_stays_under_its_rss_ceiling() {
     // The replay's budget the test pins: 4 MiB of bodies per commit,
     // the batch holds no more.
     const TX_KB: u64 = 4 * 1024;
+    // One record over the batch, the decode, the store's page cache,
+    // the margin. The bound is the twin's baseline + TX_KB + this;
+    // the measure lives on Linux, so hosts that skip it hold the name
+    // only.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    const SLACK_KB: u64 = 8 * 1024;
 
     if std::env::var_os("SCION_TEST_RESTORE_BIG").is_none() {
         println!("skipping the big restore: SCION_TEST_RESTORE_BIG arms it");
@@ -274,10 +280,6 @@ fn a_big_restore_stays_under_its_rss_ceiling() {
 /// like the source, and the fsck that says so.
 #[cfg(target_os = "linux")]
 fn measure_ceiling(store: &Backend, out: &std::path::Path, tx_kb: u64, slack_kb: u64) {
-    // One record over the batch, the decode, the store's page cache,
-    // the margin. The bound is the twin's baseline + tx_kb + this.
-    const SLACK_KB: u64 = 8 * 1024;
-    let slack_kb = SLACK_KB;
     let baseline_kb = restore_sampled(
         &empty_archive(),
         &tempfile::tempdir().unwrap().path().join("restored-empty"),
