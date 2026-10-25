@@ -109,6 +109,26 @@ impl Server {
     }
 }
 
+/// The failed start's report: the lines the server itself wrote (the log
+/// after `mark`), bounded to the tail - the CI log truncates a long line,
+/// and an exit's reason sits at the tail. A server that wrote nothing at
+/// all reports the whole log.
+fn exit_report(log: &Path, mark: usize, status: std::process::ExitStatus) -> String {
+    let text = fs::read_to_string(log).unwrap_or_default();
+    let fresh = text.get(mark..).unwrap_or_default();
+    let body = if fresh.trim().is_empty() {
+        text.as_str()
+    } else {
+        fresh
+    };
+    let lines: Vec<&str> = body.lines().collect();
+    let skip = lines.len().saturating_sub(40);
+    format!(
+        "the server exited with {status}:\n{}",
+        lines[skip..].join("\n")
+    )
+}
+
 impl Server {
     /// Starts a server on `data` and waits until it listens. It appends its
     /// log to `log`. In Postgres mode (`SCION_TEST_BACKEND=postgres`) it
@@ -118,11 +138,16 @@ impl Server {
     /// as a second SQLite run.
     pub(crate) fn start(data: &Path, log: &Path) -> Self {
         let mut server = Self::spawn(data, log);
+        // Only this start's lines are its business, and the CI log
+        // renderer truncates a long panic message - so a failed start
+        // reports the lines the server itself wrote, whose tail carries
+        // the exit's reason, not the whole shared log.
+        let mark = usize::try_from(fs::metadata(log).map_or(0, |m| m.len()))
+            .expect("the log's length fits usize");
         let start = Instant::now();
         while !server.listens(log) {
             if let Some(status) = server.child.try_wait().unwrap() {
-                let log = fs::read_to_string(log).unwrap_or_default();
-                panic!("the server exited with {status}:\n{log}");
+                panic!("{}", exit_report(log, mark, status));
             }
             assert!(start.elapsed() < Duration::from_secs(60), "no listen");
             std::thread::sleep(Duration::from_millis(10));
@@ -165,11 +190,16 @@ impl Server {
     /// harness's own 0600 token write below.
     pub(crate) fn start_on(heading: &'static str, data: &Path, log: &Path) -> Self {
         let mut server = Self::spawn_on(heading, data, log);
+        // Only this start's lines are its business, and the CI log
+        // renderer truncates a long panic message - so a failed start
+        // reports the lines the server itself wrote, whose tail carries
+        // the exit's reason, not the whole shared log.
+        let mark = usize::try_from(fs::metadata(log).map_or(0, |m| m.len()))
+            .expect("the log's length fits usize");
         let start = Instant::now();
         while !server.listens(log) {
             if let Some(status) = server.child.try_wait().unwrap() {
-                let log = fs::read_to_string(log).unwrap_or_default();
-                panic!("the server exited with {status}:\n{log}");
+                panic!("{}", exit_report(log, mark, status));
             }
             assert!(start.elapsed() < Duration::from_secs(60), "no listen");
             std::thread::sleep(Duration::from_millis(10));
@@ -249,11 +279,16 @@ impl Server {
     /// SQLite run.
     pub(crate) fn start_reopened(data: &Path, schema_source: &Path, log: &Path) -> Self {
         let mut server = Self::spawn_reopened("One server", data, schema_source, log);
+        // Only this start's lines are its business, and the CI log
+        // renderer truncates a long panic message - so a failed start
+        // reports the lines the server itself wrote, whose tail carries
+        // the exit's reason, not the whole shared log.
+        let mark = usize::try_from(fs::metadata(log).map_or(0, |m| m.len()))
+            .expect("the log's length fits usize");
         let start = Instant::now();
         while !server.listens(log) {
             if let Some(status) = server.child.try_wait().unwrap() {
-                let log = fs::read_to_string(log).unwrap_or_default();
-                panic!("the server exited with {status}:\n{log}");
+                panic!("{}", exit_report(log, mark, status));
             }
             assert!(start.elapsed() < Duration::from_secs(60), "no listen");
             std::thread::sleep(Duration::from_millis(10));

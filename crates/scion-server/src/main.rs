@@ -319,9 +319,11 @@ enum KindName {
     PathHistory,
 }
 
-/// Runs `export` and prints the manifest's counts. Exits 0, or 2 when
-/// the export could not run.
-fn archive_export(store: &Backend, data: &Path, repo: Option<&str>, all: bool, out: &Path) -> ! {
+/// Runs `export` and prints the manifest's counts, and returns the exit
+/// code: 0, or 2 when the export could not run. The code returns
+/// instead of `std::process::exit`, whose destructors skip the caller's
+/// cleanup: the staging folder goes with the run.
+fn archive_export(store: &Backend, data: &Path, repo: Option<&str>, all: bool, out: &Path) -> i32 {
     match archive::export(store, data, repo, all, out) {
         Ok(manifest) => {
             let counts = &manifest["counts"];
@@ -333,27 +335,26 @@ fn archive_export(store: &Backend, data: &Path, repo: Option<&str>, all: bool, o
                 counts["pending_lands"],
                 counts["blobs"],
             );
-            std::process::exit(0)
+            0
         }
         Err(e) => {
             eprintln!("scion-server export: {e}");
-            std::process::exit(2);
+            2
         }
     }
 }
 
-/// Runs `fsck` against `store`, prints one line per problem, and exits:
-/// 0 when it saw no damage, 1 when it did, 2 when it could not run.
-/// The exits are `std::process::exit`, which skips destructors: safe
-/// here, because nothing this function holds needs dropping — the
-/// store's lock is released by the kernel at exit, and the report is
-/// plain data.
-fn fsck_command(store: &Backend) -> anyhow::Result<()> {
+/// Runs `fsck` against `store`, prints one line per problem, and returns
+/// the exit code: 0 when it saw no damage, 1 when it did, 2 when it
+/// could not run. The code returns instead of `std::process::exit`,
+/// whose destructors skip the caller's cleanup: the staging folder goes
+/// with the run.
+fn fsck_command(store: &Backend) -> i32 {
     let report = match fsck::run(store, fsck::BATCH, &mut |_| {}) {
         Ok(report) => report,
         Err(e) => {
             eprintln!("scion-server fsck: {e}");
-            std::process::exit(2);
+            return 2;
         }
     };
     for problem in &report.problems {
@@ -367,10 +368,7 @@ fn fsck_command(store: &Backend) -> anyhow::Result<()> {
         report.problems.len(),
         report.old.len()
     );
-    if report.is_clean() {
-        std::process::exit(0);
-    }
-    std::process::exit(1);
+    i32::from(!report.is_clean())
 }
 
 /// Opens the audit log a CLI subcommand records its admin lines in:
@@ -578,6 +576,26 @@ async fn restore_command(
         report.refs,
         report.lands
     );
+    // The RSS ceiling's measurement seam (test-hooks only): at the very
+    // end, the process reads its own high-water mark - the kernel's
+    // exact peak RSS of this run, race-free because the reader is the
+    // process that lived it. The ceiling test parses this line from the
+    // child's stderr; a default build never reads the environment.
+    #[cfg(all(target_os = "linux", any(test, feature = "test-hooks")))]
+    if std::env::var_os("SCION_TEST_RESTORE_PEAK").is_some() {
+        let status = std::fs::read_to_string("/proc/self/status")
+            .context("cannot read /proc/self/status")?;
+        for line in status.lines() {
+            if let Some(kb) = line.strip_prefix("VmHWM:") {
+                // The number only: the ceiling test parses the rest of
+                // this line as the peak.
+                println!(
+                    "restore: peak RSS {}",
+                    kb.trim().trim_end_matches("kB").trim()
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -716,6 +734,30 @@ fn write_gc_metrics_file(path: &Path, report: &gc::Report, took: Duration, dry_r
             "scion-server gc: cannot write the metrics file {}: {e}",
             path.display()
         );
+    }
+}
+
+/// The staging folder a one-shot command removes when it ends - success,
+/// error, or panic - so the next open's sweep has nothing of a live run
+/// to call a crash's leftover. The server keeps its folder for its life.
+struct StagingFolder {
+    path: std::path::PathBuf,
+}
+
+impl Drop for StagingFolder {
+    fn drop(&mut self) {
+        // A failed cleanup would show up at the next start as a crash's
+        // leftover, with nothing saying why: name the path and the error.
+        // NotFound is fine: the folder is gone, which is the point.
+        if let Err(why) = std::fs::remove_dir_all(&self.path)
+            && why.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %why,
+                "the run's staging folder could not be removed"
+            );
+        }
     }
 }
 
@@ -867,6 +909,17 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
     .with_context(|| format!("cannot open data directory {}", cli.data.display()))?;
+    // A one-shot command removes its own staging folder when it ends -
+    // success, error, or panic - so the next open's sweep has nothing of
+    // a live run to call a crash's leftover. The guard is armed after
+    // the store opens; the server keeps its folder for its life.
+    let staging = if matches!(cli.command, Command::Serve { .. }) {
+        None
+    } else {
+        Some(StagingFolder {
+            path: store.temp_folder().to_path_buf(),
+        })
+    };
     match cli.command {
         Command::Serve { .. } => {
             let flags = flags.expect("a serve command validated its flags");
@@ -925,10 +978,14 @@ async fn main() -> anyhow::Result<()> {
             unreachable!("handled before the store opens")
         }
         Command::Export { repo, all, out } => {
-            archive_export(&store, &cli.data, repo.as_deref(), all, &out);
+            let code = archive_export(&store, &cli.data, repo.as_deref(), all, &out);
+            drop(staging);
+            std::process::exit(code);
         }
         Command::Fsck => {
-            return fsck_command(&store);
+            let code = fsck_command(&store);
+            drop(staging);
+            std::process::exit(code);
         }
         Command::Gc {
             grace_secs,
@@ -1134,7 +1191,9 @@ fn serve_flags(args: &ServeArgs) -> anyhow::Result<ServeFlags> {
             args.token.clone()
         }
         (None, Some(file)) => Some(secret_file(file)?),
-        (None, None) => std::env::var("SCION_TOKEN").ok().filter(|t| !t.is_empty()),
+        (None, None) => std::env::var("SCION_TOKEN")
+            .ok()
+            .filter(|t| !t.trim().is_empty()),
     };
     let (access, single) = load_access(token, None, args.access.clone())?;
     let caps = caps(
@@ -1340,7 +1399,10 @@ fn load_access(
         return Ok((scion_server::Access::single(&token), true));
     }
     if let Some(token) = token {
-        anyhow::ensure!(!token.is_empty(), "--token must not be empty");
+        anyhow::ensure!(
+            !token.trim().is_empty(),
+            "--token must not be empty or whitespace-only"
+        );
         return Ok((scion_server::Access::single(&token), true));
     }
     let file = access.expect("exactly one source is given");
@@ -1471,10 +1533,15 @@ fn hash_token() -> anyhow::Result<()> {
         (None, Some(file)) => secret_file(file)?,
         (Some(_), None) => {
             warn_argv_secret("--token", "--token-file, SCION_TOKEN or stdin");
-            token.expect("the argv form is given")
+            let token = token.expect("the argv form is given");
+            anyhow::ensure!(
+                !token.trim().is_empty(),
+                "a token of only whitespace is no secret"
+            );
+            token
         }
         (None, None) => match std::env::var("SCION_TOKEN") {
-            Ok(env_token) if !env_token.is_empty() => env_token,
+            Ok(env_token) if !env_token.trim().is_empty() => env_token,
             _ => {
                 use std::io::Read as _;
                 let mut from_stdin = String::new();

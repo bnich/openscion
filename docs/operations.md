@@ -457,7 +457,10 @@ principal, so the caps are off unless a flag sets one.
 Rewriting the access file takes effect at the next start (or restart): the
 server reads it once. A ticket keeps working for its whole life after a
 reload that narrows its principal, up to 15 minutes from signing, on this
-server and on any cache that holds the repo's objects. To revoke reads:
+server and on any cache that holds the repo's objects. Tickets live by the
+server's clock: a clock stepped back extends every live ticket by up to the
+60 seconds of skew the check allows, so run NTP in slew mode, not step, on
+a machine that serves tickets. To revoke reads:
 rewrite the file and restart, and either wait out the tickets (15 minutes)
 or rotate the ticket key (`--ticket-key`) to cut them off at once. Objects
 already on a user's daemon are out of reach of both; give a daemon only
@@ -811,6 +814,26 @@ Proof: crates/scion-server/tests/restore_bench.rs::a_restore_of_a_stated_store_t
 
 Proof: crates/scion-server/tests/backup.rs::a_backup_taken_while_serving_restores_whole
 
+On Postgres, a restore's staging schema carries a `restore_staging`
+mark from its first transaction until publication, so a restore drops
+only what a restore made: a schema that names a store and no mark is
+refused ("a restore refuses to drop a store it did not make"), never
+dropped. One window sits between a restore's last transaction and the
+rename that publishes its data directory: a restore killed there
+leaves a complete store in the schema with no mark, and the next
+restore at that URL refuses it and names the way out - rename the
+target's `<name>.restoring` directory into place and start a server on
+it, or restore into a new schema.
+
+One warning about that name: a restore's **start** deletes a
+`<name>.restoring` directory beside the target without asking - it is
+the scratch of a run that died mid-replay, never a store. Keep nothing
+under that name, and rename a leftover into place (the way out above)
+before you start the next restore.
+
+Proof: crates/scion-server/tests/archive_attacks.rs::a_restore_at_a_stopped_stores_url_refuses_and_leaves_it_whole (behaviour, no command: the proof arms a crafted archive against a stopped store's own URL, which no guide command reproduces)
+Proof: crates/scion-server/tests/archive_attacks.rs::a_restored_store_does_not_carry_the_mark_and_a_later_restore_refuses (behaviour, no command: the proof replays a zero-repo archive and writes into the restored store, which no guide command reproduces)
+
 ## 4. Upgrades
 
 The schema version lives in the database. On open, a server migrates an
@@ -861,7 +884,9 @@ re-date such a commit in the git history and import again.
 So an upgrade is: stop the server (and any tiers that share the directory —
 none do by default), copy the directory as a backup (section 3), start the
 new binary, watch the log for the migration, run `fsck`. A store that
-has data logs its migration steps when a build migrates it.
+has data logs its migration steps when a build migrates it; a first
+boot on a fresh, empty directory logs no migration - it says the store
+was created.
 
 Where the binaries come from. v0.1.0 is a source release: build the
 version you need from its signed tag (`docs/RELEASING.md`):
