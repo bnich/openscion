@@ -274,8 +274,17 @@ line is readable by every local account (`ps`), an environment value
 by the same user and root, and a file with the checks of the access
 file by whoever can read it.
 
+The database must hold the schema before the first serve: an open whose
+`search_path` names a schema that does not exist is refused (`the URL's
+search_path names no existing schema; create it first`). Make it once,
+before the first start:
+
 ```sh
-printf 'postgres://user@dbhost/scion?sslmode=require\n' > /srv/scion/db-url
+psql 'postgres://user@dbhost/scion?sslmode=require' -c 'CREATE SCHEMA scion'
+```
+
+```sh
+printf 'postgres://user@dbhost/scion?sslmode=require&options=--search_path%3Dscion\n' > /srv/scion/db-url
 chmod 600 /srv/scion/db-url
 scion-server --data /srv/scion \
   --postgres-url-file /srv/scion/db-url \
@@ -378,7 +387,10 @@ SCION_POSTGRES_URL='postgres://user@dbhost/scion?sslmode=require' \
   above that name the one-server lock and the fence are Postgres only.
 
 Backup and restore of a Postgres-backed server: `pg_dump` the database
-first, then copy the data directory. A changeset in the dump names only
+first, then copy the data directory. One database can hold several stores,
+each in its own schema; a dump of the database backs up every store in it,
+and one store alone is `pg_dump --schema <name>` (its restore reads back
+into the schema of the same name). A changeset in the dump names only
 blob files that existed when the dump was taken, and a blob file is written
 before its database row commits, so the later copy holds every file the
 dump names. Restore into a fresh database, copy the data directory back,
@@ -388,11 +400,16 @@ start the server with the same `--postgres-url`.
 
 `--token` and `--access` are exclusive. An access file names tokens by their
 BLAKE3 digest (never the token itself) and maps each to a principal with
-per-repo read and write rules:
+per-repo read and write rules. Every line is tab-separated, and the columns
+are: the line's kind (`token`, `read`, `write`), the principal, then what
+the line grants - a digest on a `token` line, a repo name on a `read` or
+`write` line. A `read` or `write` line may carry one more column, a path
+prefix that limits the rule to that folder (`read\tops\tmain\tsrc/a`
+covers `src/a/...`, not `srcx`); without it the line covers the whole repo:
 
 ```sh
 TOK=$(printf %s <SECRET> | ./scion-server hash-token)
-printf 'token\tops\t%s\nread\tops\tr\nwrite\tops\tr\n' "$TOK" > /srv/scion/access.txt
+printf 'token\tops\t%s\nread\tops\tmain\nwrite\tops\tmain\n' "$TOK" > /srv/scion/access.txt
 chmod 600 /srv/scion/access.txt
 ./scion-server --data /srv/scion serve --access /srv/scion/access.txt \
   --ticket-key /srv/scion-keys/ticket.key
@@ -560,6 +577,7 @@ its value is readable by every local account through `ps`.
 | --- | --- | --- | --- |
 | `SCION_DATA` | `--data` | `scion-server` | Data directory, default `scion-data`. |
 | `SCION_POSTGRES_URL` | `--postgres-url` | `scion-server` | The URL holds the database credentials; the environment keeps them out of the process list (`ps`). `--postgres-url-file` reads it from a file the owner alone may read, and the argv form is deprecated: it warns now and goes away in a later release. |
+| `SCION_POSTGRES_URL_FILE` | `--postgres-url-file` | `scion-server` | A file that holds the database URL. Only its owner may read it, and a symlink is refused. |
 | `SCION_TOKEN` | `--token` | `scion-server` (`serve`, `hash-token`), `scion-cache`, `scion-daemon`, `scn` | A secret; the environment keeps it out of the process list. The `--token-file` flag reads the token from a file the owner alone may read, and `hash-token` reads it from stdin. The argv form prints a deprecation warning and goes away in a later release. |
 | `SCION_UPSTREAM_TOKEN` | `--upstream-token` | `scion-cache`, `scion-daemon` | A secret, as `SCION_TOKEN`; `--upstream-token-file` reads it from a file, and the argv form is deprecated: it warns now and goes away in a later release. |
 | `SCION_DAEMON_DATA` | `--data` | `scion-daemon` | Data directory, default `scion-daemon-data`. |
@@ -1284,33 +1302,33 @@ checking out through a cache and a daemon beside it.
 
 | | |
 |---|---|
-| Commit | the `git rev-parse HEAD` of the run that produced the table |
+| Commit | ab6bfdc92314fc41d2a8c5dca0f0a13bd39b5612 the main commit the run measured (the run's own HEAD, fcb947e6, adds the grid's database name only), at [run 40119721010](https://github.com/bnsd55/openscion/actions/runs/40119721010) |
 | Runner | the hosted runner class, by its public label and spec |
+| Filesystem | the filesystem the run measured, from the run's `machine.txt` artifact (`df -T` on the work directory); the `ubuntu-24.04` class's root disk is ext4 ([support.md](support.md)) |
 | Repetitions | 2 per cell; the table reports the cell's whole run, and the run's raw samples are the workflow run's `capacity.csv` artifact |
 
 | backend | writers | readers | land p99 ms | checkout p50 ms | checkout p99 ms | timeouts | errors | server RSS MiB | landed | blob store KiB per 1k lands | database KiB per 1k lands |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| sqlite | 2 | 0 | - | - | - | - | - | - | - | - | - |
-| sqlite | 2 | 5 | - | - | - | - | - | - | - | - | - |
-| sqlite | 2 | 20 | - | - | - | - | - | - | - | - | - |
-| sqlite | 50 | 0 | - | - | - | - | - | - | - | - | - |
-| sqlite | 50 | 5 | - | - | - | - | - | - | - | - | - |
-| sqlite | 50 | 20 | - | - | - | - | - | - | - | - | - |
-| sqlite | 200 | 0 | - | - | - | - | - | - | - | - | - |
-| sqlite | 200 | 5 | - | - | - | - | - | - | - | - | - |
-| sqlite | 200 | 20 | - | - | - | - | - | - | - | - | - |
-| postgres | 2 | 0 | - | - | - | - | - | - | - | - | - |
-| postgres | 2 | 5 | - | - | - | - | - | - | - | - | - |
-| postgres | 2 | 20 | - | - | - | - | - | - | - | - | - |
-| postgres | 50 | 0 | - | - | - | - | - | - | - | - | - |
-| postgres | 50 | 5 | - | - | - | - | - | - | - | - | - |
-| postgres | 50 | 20 | - | - | - | - | - | - | - | - | - |
-| postgres | 200 | 0 | - | - | - | - | - | - | - | - | - |
-| postgres | 200 | 5 | - | - | - | - | - | - | - | - | - |
-| postgres | 200 | 20 | - | - | - | - | - | - | - | - | - |
+| sqlite | 2 | 0 | 15 | - | - | 0 | 0 | 24 | 2000 | 112318 | - |
+| sqlite | 2 | 5 | 31 | 172 | 238 | 0 | 0 | 31 | 2000 | 112324 | - |
+| sqlite | 2 | 20 | 103 | 683 | 827 | 0 | 0 | 32 | 2000 | 112366 | - |
+| sqlite | 50 | 0 | 228 | - | - | 0 | 0 | 43 | 2000 | 58798 | - |
+| sqlite | 50 | 5 | 490 | 173 | 243 | 0 | 0 | 50 | 2000 | 58848 | - |
+| sqlite | 50 | 20 | 2057 | 685 | 839 | 0 | 0 | 50 | 2000 | 58882 | - |
+| sqlite | 200 | 0 | 958 | - | - | 0 | 0 | 57 | 2000 | 78358 | - |
+| sqlite | 200 | 5 | 2170 | 175 | 248 | 0 | 0 | 74 | 2000 | 78384 | - |
+| sqlite | 200 | 20 | 9924 | 684 | 830 | 0 | 0 | 77 | 2000 | 78364 | - |
+| postgres | 2 | 0 | 64 | - | - | 0 | 0 | 20 | 2000 | 5668 | 87210 |
+| postgres | 2 | 5 | 124 | 253 | 298 | 0 | 0 | 24 | 2000 | 5668 | 87530 |
+| postgres | 2 | 20 | 243 | 879 | 1071 | 0 | 0 | 27 | 2000 | 5668 | 86618 |
+| postgres | 50 | 0 | 2309 | - | - | 0 | 0 | 33 | 2000 | 5668 | 34674 |
+| postgres | 50 | 5 | 4454 | 254 | 301 | 0 | 0 | 38 | 2000 | 5668 | 34558 |
+| postgres | 50 | 20 | 7042 | 877 | 1079 | 0 | 0 | 38 | 2000 | 5664 | 34482 |
+| postgres | 200 | 0 | 9326 | - | - | 0 | 0 | 45 | 2000 | 5668 | 62428 |
+| postgres | 200 | 5 | 18244 | 254 | 296 | 0 | 0 | 63 | 2000 | 5666 | 62366 |
+| postgres | 200 | 20 | 31584 | 869 | 1054 | 0 | 0 | 66 | 2000 | 5668 | 62406 |
 
-The cells with `-` are the ones no run has filled yet. Every cell
-runs on a store the cell's own import made: on SQLite a data directory
+Every cell runs on a store the cell's own import made: on SQLite a data directory
 the cell created, on Postgres a database the cell dropped and
 recreated, so a cell's numbers are the store's at its own size, and
 the growth column is the cell's own lands' bytes. The timeouts column
