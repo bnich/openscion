@@ -140,13 +140,12 @@ impl Tiers {
 
         let node = tempfile::tempdir().unwrap();
         let store_dir = DiskStore::open(&node.path().join("data"), 64 << 20).unwrap();
-        let daemon = Tier::new(
+        let daemon = Tier::new_relay(
             store_dir,
             &cache_url,
             TOKEN,
             DAEMON_UPSTREAM_TIMEOUT,
             None,
-            Vec::new(),
         )
         .unwrap();
         // The socket's directory must be private.
