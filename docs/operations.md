@@ -238,9 +238,14 @@ example gives the cache the same caller token the server holds.
 ### Server, cache, and a daemon per user
 
 ```sh
+mkdir -p ~/.scion-daemon
 SCION_TOKEN=<USER_TOKEN> SCION_UPSTREAM_TOKEN=<CACHE_TOKEN> \
   ./scion-daemon --data ~/.scion-daemon --upstream http://CACHE:7879
 ```
+
+The daemon refuses a data directory that does not exist, like the
+server does: a typo must not make a new empty store and serve from
+it.
 
 The daemon's data directory must be private to its user (mode 0700, not a
 shared path such as `/tmp`); it serves on a 0600 Unix socket in it
@@ -876,7 +881,9 @@ re-date such a commit in the git history and import again.
 So an upgrade is: stop the server (and any tiers that share the directory —
 none do by default), copy the directory as a backup (section 3), start the
 new binary, watch the log for the migration, run `fsck`. A store that
-has data logs its migration steps when a build migrates it.
+has data logs its migration steps when a build migrates it; a first
+boot on a fresh, empty directory logs no migration - it says the store
+was created.
 
 Where the binaries come from. v0.1.0 is a source release: build the
 version you need from its signed tag (`docs/RELEASING.md`):
