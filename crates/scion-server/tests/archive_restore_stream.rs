@@ -187,27 +187,33 @@ fn a_restore_commits_bounded_transactions_and_answers_like_its_source() {
 }
 
 /// The nightly ceiling: a big archive, restored by the `scion-server
-/// restore` subcommand in its own process, whose peak RSS the test
-/// samples. The bound is self-calibrating: the test first measures an
-/// empty archive's restore in a twin process - that peak is the
-/// binary's own footprint, whatever platform it runs on - and the big
-/// restore must stay under that baseline plus a slack the streamed
-/// replay's own memory (one changeset body, the read buffer) bounds.
-/// A fixed ceiling would pin one platform's allocator. The archive's
-/// `changesets.bin` must be at least twice the slack, so the old
-/// whole-file read would blow the bound and the guard is not vacuous.
-/// `SCION_TEST_RESTORE_BIG` arms it, and it runs only in a release
-/// build on CI (the nightly, main and a dispatch): the fixture holds
-/// too much store for a shared dev machine. The size rides the
-/// changesets' messages: a few changesets with big bodies fill the
-/// archive without the store a long chain would grow.
+/// restore` subcommand in its own process, whose peak RSS the child
+/// names itself (its own kernel high-water mark, printed at the end).
+/// The bound is self-calibrating: the test first measures an empty
+/// archive's restore in a twin process - that peak is the binary's
+/// own footprint, whatever platform it runs on - and the big restore
+/// must stay under the twin's baseline plus the replay's OWN budget.
+/// The replay commits per byte budget and holds the batch's decoded
+/// changesets, so its memory is a function of the budget, not of the
+/// history - the test pins the budget low (4 MiB, the
+/// `SCION_TEST_RESTORE_TX_BYTES` lever) so a whole-history read cannot
+/// hide inside an allowance sized like a production budget. The
+/// archive's `changesets.bin` must be at least twice that budget, so
+/// the old whole-file read (unbudgeted, the file whole) would blow
+/// the bound and the guard is not vacuous. `SCION_TEST_RESTORE_BIG`
+/// arms it, and it runs only in a release build on CI (the nightly,
+/// main and a dispatch): the fixture holds too much store for a
+/// shared dev machine. The size rides the changesets' messages: a few
+/// changesets with big bodies fill the archive without the store a
+/// long chain would grow.
 #[test]
 fn a_big_restore_stays_under_its_rss_ceiling() {
     const CHAIN_BIG: usize = 64;
     const MESSAGE_BYTES: usize = 200 * 1024;
-    // The replay's own allowance over the twin's baseline: one
-    // changeset body, the read buffer, the store's open.
-    const SLACK_KB: u64 = 4 * 1024;
+    // The replay's budget the test pins: 4 MiB of bodies per commit,
+    // the batch holds no more.
+    const TX_KB: u64 = 4 * 1024;
+
     if std::env::var_os("SCION_TEST_RESTORE_BIG").is_none() {
         println!("skipping the big restore: SCION_TEST_RESTORE_BIG arms it");
         return;
@@ -245,11 +251,11 @@ fn a_big_restore_stays_under_its_rss_ceiling() {
         .unwrap()
         .len()
         / 1024;
-    println!("changesets.bin is {bin_len} KiB; the slack is {SLACK_KB} KiB");
+    println!("changesets.bin is {bin_len} KiB; the budget is {TX_KB} KiB");
     assert!(
-        bin_len >= 2 * SLACK_KB,
-        "changesets.bin ({bin_len} KiB) must be at least twice the slack ({SLACK_KB} KiB), \
-         or the old whole-file read would fit under it"
+        bin_len >= 2 * TX_KB,
+        "changesets.bin ({bin_len} KiB) must be at least twice the replay's budget \
+         ({TX_KB} KiB), or the old whole-file read would fit under it"
     );
 
     // A restore runs as its own process, so the peak RSS measured is
@@ -258,7 +264,7 @@ fn a_big_restore_stays_under_its_rss_ceiling() {
     // footprint on this machine, and the bound rides on it. The
     // ceiling runs where the CI job runs it: Linux.
     #[cfg(target_os = "linux")]
-    measure_ceiling(&store, &out, SLACK_KB);
+    measure_ceiling(&store, &out, TX_KB, SLACK_KB);
     #[cfg(not(target_os = "linux"))]
     println!("the ceiling measures wait4 peaks on Linux only; skipping here");
 }
@@ -267,21 +273,27 @@ fn a_big_restore_stays_under_its_rss_ceiling() {
 /// restore's peak under baseline + slack, the restored store answering
 /// like the source, and the fsck that says so.
 #[cfg(target_os = "linux")]
-fn measure_ceiling(store: &Backend, out: &std::path::Path, slack_kb: u64) {
+fn measure_ceiling(store: &Backend, out: &std::path::Path, tx_kb: u64, slack_kb: u64) {
+    // One record over the batch, the decode, the store's page cache,
+    // the margin. The bound is the twin's baseline + tx_kb + this.
+    const SLACK_KB: u64 = 8 * 1024;
+    let slack_kb = SLACK_KB;
     let baseline_kb = restore_sampled(
         &empty_archive(),
         &tempfile::tempdir().unwrap().path().join("restored-empty"),
+        tx_kb * 1024,
     );
     let target = tempfile::tempdir().unwrap().path().join("restored");
-    let peak_kb = restore_sampled(out, &target);
+    let peak_kb = restore_sampled(out, &target, tx_kb * 1024);
     println!(
         "the streamed restore's peak RSS was {peak_kb} kB; \
-         the bound is the twin's baseline {baseline_kb} kB + the replay's slack {slack_kb} kB"
+         the bound is the twin's baseline {baseline_kb} kB + the replay's budget \
+         {tx_kb} kB + the slack {slack_kb} kB"
     );
     assert!(
-        peak_kb <= baseline_kb + slack_kb,
+        peak_kb <= baseline_kb + tx_kb + slack_kb,
         "the restore's peak RSS ({peak_kb} kB) passed the ceiling \
-         (baseline {baseline_kb} kB + slack {slack_kb} kB); \
+         (baseline {baseline_kb} kB + budget {tx_kb} kB + slack {slack_kb} kB); \
          a whole-history read is back"
     );
 
@@ -384,7 +396,7 @@ fn empty_archive() -> std::path::PathBuf {
 /// high-water mark (`VmHWM`, KiB) when the run is over - no sampling,
 /// no race, a short process's peak as exact as a long one's.
 #[cfg(target_os = "linux")]
-fn restore_sampled(archive: &std::path::Path, target: &std::path::Path) -> u64 {
+fn restore_sampled(archive: &std::path::Path, target: &std::path::Path, tx_bytes: u64) -> u64 {
     std::fs::create_dir_all(target).unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
         .arg("--data")
@@ -392,6 +404,7 @@ fn restore_sampled(archive: &std::path::Path, target: &std::path::Path) -> u64 {
         .arg("restore")
         .arg("--archive")
         .arg(archive)
+        .env("SCION_TEST_RESTORE_TX_BYTES", tx_bytes.to_string())
         .env("SCION_TEST_RESTORE_PEAK", "1")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
