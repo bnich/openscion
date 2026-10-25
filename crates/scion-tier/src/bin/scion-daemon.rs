@@ -88,6 +88,27 @@ struct Cli {
 /// The two tokens of a tier: what it asks for, and what it sends
 /// upstream. Each resolves through the checked file, the env, or the
 /// argv form, which warns.
+/// Refuses a data directory that does not exist, with the server's
+/// message shape: a typo in `--data`, or a run from the wrong folder,
+/// must not make a new empty store and serve from it. The daemon's
+/// `--data` defaults to a working-directory-relative name, so the
+/// refusal runs first, wherever the binary runs.
+///
+/// # Errors
+/// The directory is not a directory, or does not exist.
+fn refuse_missing_data_dir(data: &std::path::Path) -> anyhow::Result<()> {
+    if data.is_dir() {
+        return Ok(());
+    }
+    if data.exists() {
+        return Err(anyhow::anyhow!("{} is not a directory", data.display()));
+    }
+    Err(anyhow::anyhow!(
+        "{} does not exist; create it or pass --data",
+        data.display()
+    ))
+}
+
 fn resolve_tokens(cli: &Cli) -> anyhow::Result<(String, String)> {
     let token = secret_of(
         cli.token.as_deref(),
@@ -157,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
+    refuse_missing_data_dir(&cli.data)?;
     let (token, upstream) = resolve_tokens(&cli)?;
     anyhow::ensure!(
         cli.seed.is_empty() || cli.seed_full_repo,
@@ -176,15 +198,17 @@ async fn main() -> anyhow::Result<()> {
     for path in &cli.seed {
         seed(&store, path);
     }
-    let tier = Tier::new(
+    // A daemon checks no ticket and walks nothing: it forwards the
+    // ticket as it came, and the 0600 socket (one OS user, the socket's
+    // owner) and the upstream's checks are the gates. The relay mode is
+    // this constructor's explicit choice, never a fallthrough of an
+    // empty key list.
+    let tier = Tier::new_relay(
         store,
         &cli.upstream,
         &upstream,
         DAEMON_UPSTREAM_TIMEOUT,
         Some(&client_tls),
-        // A daemon does not check tickets: it forwards them, and its
-        // upstream does the checking. Only the walk gates what it serves.
-        Vec::new(),
     )?;
     let socket = cli.socket.unwrap_or_else(|| cli.data.join("daemon.sock"));
     let listener = bind_unix(&socket)
