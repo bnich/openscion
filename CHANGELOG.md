@@ -16,6 +16,78 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Added
 
+- The three contract formats now carry the goldens that enforce their
+  additive rules: the store's byte pins and unknown-tag refusal
+  (crates/scion-core/tests/golden.rs), the protocol's wire golden and
+  unknown-field-ignore test (crates/scion-proto/tests/wire_golden.rs
+  with protocol_wire_v1.golden), and the archive's byte golden and
+  unknown-version refusal (crates/scion-server/tests/archive_attacks.rs
+  against archive_v1.golden). The pairing is enforced on the pull
+  request's own diff: scripts/check-golden-pairing.sh (the CI lint job).
+  A pinned-byte change (the wire golden, the store pins, the archive
+  golden) fails without its format document's version line in the same
+  pull request. The proto file and the surface golden are additive: they
+  need no new version, only the same pull request changing
+  docs/protocol-v1.md (any line - the contract must describe the new
+  surface), with its own message.
+- The Postgres recovery rows of the production audit close in the
+  operations guide: re-pairing a lost backend marker (write the two-line
+  marker back with the store UUID the refusal names - and never for a
+  directory the database was never served with), and the one-server rule
+  after an unclean kill (the first start refuses until Postgres ends the
+  dead session's advisory lock; the service manager's restart is the
+  whole recovery on the same host, and pg_terminate_backend or
+  tcp_keepalives_idle for a lost one)
+  (`crates/scion-server/tests/backend_refusals.rs::a_lost_marker_written_back_as_the_runbook_says_reopens_the_store`).
+- # The second operator's drill, in the record's shape
+  
+  docs/drills/second-operator.md is the drill a human second operator
+  runs (#396): ten tasks from install to the alert runbooks, each with
+  its runbook section, the runbook's own commands verbatim, its
+  done-when, and a blank for the operator's notes; the header holds the
+  record of who ran it, when, and against which commit. A command that
+  the runbook does not print does not appear: the two steps the runbook
+  states in prose (creating the data directory, the gc first run's
+  `--dry-run`) say so and hand the choice to the operator's notes. The
+  database-container step is marked Linux. The guesses log stays: a
+  filled row is a gap in the runbook, not a failure.
+- The 72-hour soak of issue #239's run-length decision is ready for the
+  day a VM is rented for it, and runs nothing until then. A
+  dispatch-only `soak-72h` workflow waits for one self-hosted runner
+  with the `scion-soak` label (a label no other job names), gives it
+  4400 minutes, and runs one uninterrupted 72-hour soak (RUN_MINUTES
+  4320, the same ceilings and warm-up window as the nightly). It is
+  never a pull_request, push or scheduled run, and the fault job stays a
+  nightly of its own.
+  
+  The job's `GITHUB_TOKEN` is dead after 24 hours, so the long job calls
+  nothing with it after its checkout: the samples stream to files on the
+  runner's disk while it runs (`metrics.csv`, `metrics-store.csv`, the
+  logs), and a separate short job - `needs: soak-72h`, `if: always()`, a
+  fresh token - uploads them. With one `scion-soak` runner, the upload
+  job lands on the same machine and reads the same disk.
+  
+  `scripts/soak-runner-setup.md` registers the runner on a fresh Ubuntu
+  VM as a normal runner (NOT `--ephemeral`: the workflow's two jobs both
+  need it, and an ephemeral runner de-registers after the first, leaving
+  the upload waiting forever), sizes the disk at about 300 GB for the
+  store (one 30-minute release run: 334 MB -> 8.95 GB beside 22,930
+  lands, slowing as it goes) plus system and margin, and removes the
+  runner (`config.sh remove`) and the VM after. Because the repository
+  is public, the doc also names the fork-PR risk - a fork workflow can
+  target the runner's label while it is up - and the owner's two doors:
+  the fork-PR approval policy is tightened to all external contributors
+  before the runner is registered and put back to
+  `first_time_contributors` after, and the runner exists only for the
+  rental.
+- A CI job opens a store written by each tagged release and upgrades it
+  directly: the tagged store opens under this build, the migration runs
+  forward, reads and writes then work, and a store of this build is refused
+  by the tagged binary with the version reason. The direct upgrade must be
+  the same store that upgrading stepwise through every tag gives -- a
+  migration that is order-dependent fails the job. The stores are built in
+  CI from the tags and read back under their own tag's binary first; with
+  no release tag the job says so and starts at v0.1.0.
 - The supply-chain job now runs cargo-deny in every fuzz
     sub-workspace, each of which holds its own Cargo.lock the root check
     never read — the gap that let RUSTSEC-2026-0382 sit in three fuzz
@@ -463,7 +535,7 @@ The first release: the server, its cache tiers, and the `scn` client.
   
   docs/drills/release-drill.md runs RELEASING.md as a second maintainer,
   starting with the dry run, and marks every step that today needs the
-  owner: the signed tag (their personal SSH key, D18), the refs/tags/v*
+  owner: the signed tag (their personal SSH key), the refs/tags/v*
   ruleset, and the immutable-releases setting - the v0.8 list. Both files
   carry the record header, the done-whens, and the notes blanks, and
   keep to what the runbooks already say.
@@ -1084,6 +1156,60 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Changed
 
+- The daemon refuses a data directory that does not exist.
+  
+  scion-daemon's `--data` defaults to a working-directory-relative name
+  and the daemon created it when it was missing, so a typo in `--data`,
+  or a run from the wrong folder, made a new empty store and served from
+  it. The daemon now refuses a missing data directory before it opens
+  the store, with the server's message shape ("does not exist; create
+  it or pass --data"), and creates nothing. The cache keeps no data
+  directory (memory only), so it has no path to refuse. Scripts and
+  docs that start the daemon on a fresh path create it first.
+- A fresh store's first open logs what happened, and the temp-folder
+  sweep claims only what it knows. A creation logged nine fake migration
+  lines ("migrating the metadata schema 0->9", one per step) for a
+  database that moved nothing; it now logs one line, "the metadata schema
+  was created to_version=9". The sweep's "removed temp folders that a
+  crash left behind" fired for folders whose process is gone whatever the
+  way it went - a crash's leftovers or a one-shot import's clean exit;
+  the line now says that. A store with data keeps its whole per-step
+  migration story unchanged (`crates/scion-server/tests/migrate_log.rs`).
+- The server's global flags (`--data`, `--postgres-url`,
+  `--postgres-url-file`, `--postgres-ca`) parse after the subcommand too:
+  `scion-server fsck --data D` is the same call as
+  `scion-server --data D fsck`. Before, the flags parsed only before the
+  subcommand, and the after-position gave a bare usage error with no
+  hint. The rules the flags already carry (the URL file and URL conflict,
+  the CA requiring a URL) hold in both positions; the token flags of `scn`
+  are unchanged and still parse before the subcommand only.
+- The server no longer creates a missing data directory. Every
+  scion-server subcommand except restore now refuses a directory that
+  does not exist -- given by --data, SCION_DATA, or the default
+  scion-data in the working directory -- with one message: "<path> does
+  not exist; create it or pass --data". restore still creates its
+  target. Update scripts that relied on auto-create: create the
+  directory first, or keep passing an existing --data (operations.md's
+  examples already do).
+- A restore holds one archive section at a time and replays it in
+  bounded transactions, instead of holding a repo's whole changeset
+  stream in memory: a restore of a large repo no longer needs RSS the
+  size of its history. The archive format is unchanged; archives written
+  by an older build restore as before
+  (`crates/scion-server/tests/archive.rs`).
+- `scn` prints the changeset and object IDs its parser reads back, and
+  its refusals say what went wrong: a relative repo path, the
+  unstable-writable mount without its build feature, and the other
+  failures name their cause instead of a bare status.
+- The tier's logs stop writing the traffic they serve. The daemon and the cache logged one INFO line per GetObjects call, and their logs colored every line whether or not stderr was a terminal; 66 hours of the soak wrote 7.7 GB of daemon log (#399 Run A). Color now shows only when stderr is a terminal, the per-call line is DEBUG, and the hit and miss counts stay in the metrics' cache_counts, which already had them. No log rotation, no log file flag, no JSON logs in this change.
+- The writable mount is a build feature, off by default: a build without
+  `--features unstable-writable-mount` has no write path at all, and
+  `scn mount` without the feature refuses the flag before it connects.
+  The read-only mount every build has is unchanged, and the vfs suite's
+  symlink tests run in the feature build while the default build's tests
+  hold the no-writable-mount surface. The write path stays out of
+  release builds until a rewrite that opens each path step by handle
+  passes the hostile tests.
 - A `Log` page checks its deadline before its first entry and then once
   every 16 entries, not before each one. A check reads the clock, a system
   call where the clocksource has no user-space read (HPET), and on such a
@@ -1401,6 +1527,57 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
+- The production audit's evidence now holds as tests: a tampered history
+  node reads as corrupt through the server path (`get_history_node`
+  answers "does not match its ID"), and fsck reports the row
+  ("history-node-bad"), on both backends (`tests/audit_evidence.rs`). The
+  audit's evidence cells name the lines and dispatch runs that exist, and
+  the writer-idle probe's role and its untested cadence are stated in the
+  runbook and the audit.
+- A docs-only pull request never ran the docs tests: the test job skips
+  them, and the docs job ran only rustdoc, so a broken link or a stale
+  doc landed and failed main's first run. A docs-tests job now runs the
+  docs_*.rs integration tests on every pull request (and the same
+  events), and fails when a docs_*.rs file exists that it does not name.
+- The backup-N-1 and store-upgrade drills kill every server they
+  backgrounded on any exit path, TERM then KILL, via the pid files the
+  starter wrote. Before, a drill that died between starting and stopping
+  a server left it running unparented. A drill run without a caller-named
+  run directory now writes under `.scn-drills/` in the repository, not in
+  the shared temp directory.
+- An access file that named the digest of an empty token authenticated
+  every client that sent an empty bearer, and `hash-token --token ''`
+  printed that digest, so an operator could mint it by accident. The
+  access-file parser refuses the empty token's digest with the fix named
+  ("hash the real token with `hash-token`"), `hash-token` refuses empty
+  and whitespace-only input in every form, the server refuses a
+  whitespace-only `--token` at start, and a server whose access file
+  names the empty digest does not start
+  (`scion-server/tests/empty_token.rs`). Tokens with leading or trailing
+  spaces keep their bytes: only a token that is all whitespace is
+  refused.
+- An import refused nothing when a git commit's date carried git's
+  unknown-offset zone `-0000`: the sign check folded the minus into a
+  zero and the commit imported with a `+0000` date, silently rewriting
+  history. Such a commit is refused now, on the author and the
+  committer line alike; every real zone still imports with its offset.
+- A daemon whose socket path held a symlink followed it and bound the
+  socket at the symlink's target, a path the private-directory check
+  never saw. `bind_unix` now refuses anything at the socket path that is
+  not a socket file of this user's earlier run: a symlink, a regular
+  file, or a directory is refused with the path named, a stale socket
+  that nothing listens on is re-bound as before, and nothing is followed
+  or overwritten
+  (`scion-proto/tests/socket_symlink.rs`).
+- Every promise in stability.md and compatibility.md now names what
+  enforces it, and the naming is checked: the ticket prefix's literal
+  bytes (`scion\0ticket\0v1\0`) are pinned by a unit test (the version
+  byte was, the prefix string was not - a rewrite would have passed
+  every test while every held ticket stopped verifying), and the
+  schema rows name the drills that run today instead of the issues
+  that promised them: the tagged-store ladder is store-upgrade.yml
+  (pinned stand-in commits until a tag exists) and the N-1 restore
+  drill is backup-n1.yml.
 - The import's history nodes are written in batches: the nodes a
   transaction inserted answer its own reads, and the flush writes one
   statement per 1,000 rows after the derived rows and before the git
@@ -2074,6 +2251,28 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Security
 
+- The server's fuzz lockfile no longer pins the vulnerable gix
+  (RUSTSEC-2026-0382): `cargo update -p gix` moved the gix family in
+  `crates/scion-server/fuzz/Cargo.lock` to 0.90.0 (#587 moved only the
+  root lock). A fuzz lockfile that no longer matches its manifest now
+  fails the deps job (`cargo metadata --locked` per fuzz sub-workspace),
+  where a stale pin previously re-resolved in place and failed nothing,
+  and Dependabot watches each fuzz sub-workspace, so the next advisory
+  in one cannot sit unseen (#572 rule: every fault row names its guard).
+- gix 0.89 -> 0.90, the advisory GHSA-q54r-jf2p-rfr2 (HIGH, "untrusted .git/config disables filesystem .git-protection path checks via unfiltered protect_options()"). Only the gix crates move in the lock; no API break, no behavior change. Our gix surface reads objects and diffs blobs in memory (import.rs: gix::open, rev_parse_single, find_commit, find_blob; blame.rs: gix::diff::blob) and never checks out a worktree, so the vulnerable path is not reached; the bump is defense in depth until RustSec carries the entry for cargo-deny.
+- A cache started without `--ticket-public-key` served objects to any
+  ticket its callers presented (#625): the empty key list sent the cache down the
+  daemon's relay path, which parses the ticket without its signature and
+  skips the proof walk, so any caller that reached the cache could read
+  any object it holds, past repo and folder rules. The relay is now the
+  daemon's explicit constructor, a cache refuses to start without the key
+  (`Tier::new` refuses an empty list), and the call path chooses by the
+  stored mode, never by emptiness
+  (`scion-tier/tests/keyless_cache.rs::a_cache_without_a_public_key_does_not_start`).
+  What an operator must do: start every cache with `--ticket-public-key`
+  (the hex that `scion-server ticket-key` printed); an existing cache
+  started without it must be restarted with the key, and any caller that
+  reached it in that state is treated as having read its store.
 - The access file of `--access` holds bearer tokens and rules, and was
   read by plain path: no check of the directories above it, no symlink
   refusal, no owner or mode check, so a file another user holds - and can
