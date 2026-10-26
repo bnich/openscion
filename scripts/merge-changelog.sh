@@ -113,24 +113,24 @@ for section in added changed fixed security; do
             exit 1
             ;;
         esac
+        if [ ! -s "$fragment" ]; then
+            echo "fragment is empty: $fragment" >&2
+            exit 1
+        fi
+        if [ "$(head -n 1 "$fragment")" = "---" ]; then
+            echo "fragment starts with front matter ('---'); it is plain text: $fragment" >&2
+            exit 1
+        fi
+        # The first line becomes the row, so whitespace or a row
+        # marker on it would double ("- - x" or an indented row).
+        # Later lines may carry a nested bullet ("- ") or an indent,
+        # which the merge keeps inside the row, as the landed
+        # fragments write them.
+        if head -n 1 "$fragment" | grep -qn '^\([[:space:]]\|- \)'; then
+            echo "fragment's first line starts with whitespace or a row marker ('- '); it is plain text: $fragment" >&2
+            exit 1
+        fi
         if [ -n "$check" ]; then
-            if [ ! -s "$fragment" ]; then
-                echo "fragment is empty: $fragment" >&2
-                exit 1
-            fi
-            if [ "$(head -n 1 "$fragment")" = "---" ]; then
-                echo "fragment starts with front matter ('---'); it is plain text: $fragment" >&2
-                exit 1
-            fi
-            # The first line becomes the row, so whitespace or a row
-            # marker on it would double ("- - x" or an indented row).
-            # Later lines may carry a nested bullet ("- ") or an indent,
-            # which the merge keeps inside the row, as the landed
-            # fragments write them.
-            if head -n 1 "$fragment" | grep -qn '^\([[:space:]]\|- \)'; then
-                echo "fragment's first line starts with whitespace or a row marker ('- '); it is plain text: $fragment" >&2
-                exit 1
-            fi
             continue
         fi
         # A fragment is plain text: no row marker, no indent. The row
@@ -192,6 +192,14 @@ if [ -s "$merged" ]; then
     done <"$merged"
     echo "merged and deleted:"
     cat "$merged"
+elif [ -n "$check" ]; then
+    # --check merged nothing by design; the fragments it checked are the
+    # ones every find matched this run. Silence here would read as "no
+    # fragments in changes/" and hide the work the check did.
+    n=$({ find "$frag_dir" -maxdepth 1 -type f \( -name '*.added.md' \
+        -o -name '*.changed.md' -o -name '*.fixed.md' \
+        -o -name '*.security.md' \) 2>/dev/null || true; } | wc -l | tr -d ' ')
+    echo "$n fragments pass the checks"
 else
     echo "no fragments in $frag_dir/"
 fi
