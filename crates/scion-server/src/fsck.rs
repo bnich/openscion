@@ -706,16 +706,29 @@ mod tests {
     fn an_unreadable_blob_root_is_a_loud_error_not_a_clean_report() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        struct Restore(std::path::PathBuf, std::fs::Permissions);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                std::fs::set_permissions(&self.0, self.1.clone()).unwrap();
+            }
+        }
+
+        if rustix::process::geteuid().as_raw() == 0 {
+            eprintln!("skipped: root reads through any mode, the check would mean nothing");
+            return;
+        }
+
         let (_dir, store, _) = store();
         let root = store.blobs().root().to_path_buf();
         let mode = std::fs::metadata(&root).unwrap().permissions();
+        let _restore = Restore(root.clone(), mode);
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let result = run(&Backend::sqlite(store.clone()), 1, &mut |_| {});
-        std::fs::set_permissions(&root, mode).unwrap();
-        let err = result.unwrap_err();
+        let err = run(&Backend::sqlite(store.clone()), 1, &mut |_| {}).unwrap_err();
+        let text = err.to_string();
+        let shown = root.to_string_lossy().into_owned();
         assert!(
-            !err.to_string().is_empty(),
-            "the error must say what could not be read"
+            text.contains(&shown) || text.contains("Permission denied"),
+            "the error must name the unreadable root {shown} or the denial: {text}"
         );
     }
 
