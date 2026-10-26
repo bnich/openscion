@@ -21,6 +21,15 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      salt:
+        description: 'extra key salt: a new value forces a cache miss'
+        required: false
+        default: 'warm'
+      filter:
+        description: 'nextest filter expression for the default measure'
+        required: false
+        default: ''
 
 # Every third-party action is pinned to the commit SHA its version tag
 # named, with the version in a comment, as ci.yml does.
@@ -125,7 +134,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: coverage-build-${{ runner.os }}-stable-${{ hashFiles('Cargo.lock') }}-sqlite
+          key: coverage-build-${{ runner.os }}-stable-${{ hashFiles('Cargo.lock') }}-${{ inputs.salt || 'warm' }}
           restore-keys: coverage-build-${{ runner.os }}-stable-${{ hashFiles('Cargo.lock') }}-
       # The image ships dozens of gigabytes of toolchains this job
       # never touches; they go.
@@ -190,7 +199,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
-          key: coverage-build-${{ runner.os }}-stable-${{ hashFiles('Cargo.lock') }}-sqlite
+          key: coverage-build-${{ runner.os }}-stable-${{ hashFiles('Cargo.lock') }}-${{ inputs.salt || 'warm' }}
       - name: measure, the default backend
         run: |
           set -o pipefail
@@ -287,7 +296,12 @@ jobs:
           # else - no name pattern, nothing of the step or the watcher.
           sum="${GITHUB_STEP_SUMMARY:-/dev/null}"
           echo "default measure starts at $(date -u +%T)" >> "$sum" || true
-          setsid bash -c 'echo $$ > measure.pgid; nice -n 19 cargo nextest run --profile coverage --workspace --no-fail-fast; echo $? > measure.rc' \
+          echo "--- what the build left behind ---" || true
+          ps -eo pid,ppid,etime,rss,args --sort=-rss | head -15 || true
+          env | grep -E "^(RUSTFLAGS|CARGO_|LLVM_PROFILE_FILE)" || true
+          echo "--- end of the build's leftovers ---" || true
+          export FILTER="${{ inputs.filter }}"
+          setsid bash -c "echo \$\$ > measure.pgid; nice -n 19 cargo nextest run --profile coverage --workspace --no-fail-fast \${FILTER:+-E \"\$FILTER\"}; echo \$? > measure.rc" \
             | tee measure.log
           echo "default measure ends at $(date -u +%T)" >> "$sum" || true
           # The step must not fail on a watcher that is already gone:
