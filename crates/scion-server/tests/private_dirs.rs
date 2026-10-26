@@ -199,7 +199,7 @@ fn serve_starts_with_its_ticket_key_in_a_data_directory_that_it_made() {
 
 /// A restore publishes the staging directory by one rename, so the
 /// restored data directory carries the staging's mode. The staging must
-/// therefore be private: a restore under umask 022 (a plain create_dir_all
+/// therefore be private: a restore under umask 022 (a plain `create_dir_all`
 /// would give 0755) leaves the target 0700, every directory below it 0700,
 /// so no other user reaches the store files whatever their own modes are.
 #[test]
