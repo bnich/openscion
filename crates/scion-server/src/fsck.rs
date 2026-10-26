@@ -652,7 +652,7 @@ mod tests {
 
     /// A store with one changeset on `main`.
     fn store() -> (TempDir, Store, ChangesetId) {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let store = Store::open(dir.path()).unwrap();
         let id = land(
             &store,
@@ -1077,7 +1077,7 @@ mod tests {
 
     #[test]
     fn fsck_beside_a_live_server_sees_no_damage() {
-        let dir = TempDir::new().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let store = Store::open(dir.path()).unwrap();
         let mut id = land(
             &store,
