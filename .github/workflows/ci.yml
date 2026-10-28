@@ -283,6 +283,22 @@ jobs:
       ${{ !cancelled() && (needs.tier.result == 'success' || needs.tier.result == 'skipped') && !github.event.pull_request.draft }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    services:
+      # The suite's Postgres tests read this database; the backend the
+      # tests choose is unchanged for now (SCION_TEST_BACKEND stays
+      # unset), and the URL is in place for the switch.
+      postgres:
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -307,6 +323,8 @@ jobs:
           for f in "${cli_files[@]}"; do cli_args+=(--test "$(basename "$f" .rs)"); done
           cargo test -p open-scion-server "${server_args[@]}"
           cargo test -p open-scion "${cli_args[@]}"
+        env:
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
 
   supply-chain:
     name: cargo-deny
@@ -452,6 +470,22 @@ jobs:
       ${{ !cancelled() && (github.event_name != 'pull_request' && (needs.tier.result == 'success' || needs.tier.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    services:
+      # The suite's Postgres tests read this database; the backend the
+      # tests choose is unchanged for now (SCION_TEST_BACKEND stays
+      # unset), and the URL is in place for the switch.
+      postgres:
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -466,6 +500,7 @@ jobs:
         run: cargo test --release -p open-scion-server --test archive_restore_stream a_big_restore -- --nocapture
         env:
           SCION_TEST_RESTORE_BIG: "1"
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
       - name: the whole-file read would not (the guard is not vacuous)
         # The mutated run must fail for THE CEILING's reason, not any
         # reason: a compile error or a missing /proc would "fail" the
@@ -634,6 +669,22 @@ jobs:
       ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' && needs.tier.outputs.mount == 'true')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    services:
+      # The suite's Postgres tests read this database; the backend the
+      # tests choose is unchanged for now (SCION_TEST_BACKEND stays
+      # unset), and the URL is in place for the switch.
+      postgres:
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -646,6 +697,8 @@ jobs:
       # The feature build's tests: the write-side unit tests of the VFS
       # and the from-mount suite, which the default build compiles out.
       - run: cargo test -p open-scion --features unstable-writable-mount
+        env:
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
 
   test-macos:
     name: test (macOS)
@@ -740,6 +793,22 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 40
+    services:
+      # The suite's Postgres tests read this database; the backend the
+      # tests choose is unchanged for now (SCION_TEST_BACKEND stays
+      # unset), and the URL is in place for the switch.
+      postgres:
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -750,10 +819,12 @@ jobs:
       - run: cargo test --workspace
         env:
           PROPTEST_CASES: "2000"
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
       - name: a real disk full (tmpfs)
         run: cargo test -p open-scion-server --test disk_full
         env:
           SCION_DISK_REQUIRE: "1"
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
 
   # The xfs cell of the support matrix (docs/support.md): every store
   # the server suite opens lands on a real xfs loop device, through
@@ -768,6 +839,22 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    services:
+      # The suite's Postgres tests read this database; the backend the
+      # tests choose is unchanged for now (SCION_TEST_BACKEND stays
+      # unset), and the URL is in place for the switch.
+      postgres:
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -791,6 +878,7 @@ jobs:
           # The xfs job proves filesystem parity, not more cases; the
           # SQLite job on the runner disk already runs 2000.
           PROPTEST_CASES: "64"
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
       - name: the loop device goes away
         if: always()
         run: |
@@ -981,6 +1069,22 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    services:
+      # The suite's Postgres tests read this database; the backend the
+      # tests choose is unchanged for now (SCION_TEST_BACKEND stays
+      # unset), and the URL is in place for the switch.
+      postgres:
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -996,6 +1100,8 @@ jobs:
       # object hashes to its ID with b3sum. The script fetches the pinned
       # grpcurl release and checks its sha256 before it runs.
       - run: scripts/grpc-conformance.sh
+        env:
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
 
   docker:
     name: docker demo
@@ -1025,6 +1131,22 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    services:
+      # The suite's Postgres tests read this database; the backend the
+      # tests choose is unchanged for now (SCION_TEST_BACKEND stays
+      # unset), and the URL is in place for the switch.
+      postgres:
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
