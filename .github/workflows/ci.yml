@@ -667,6 +667,21 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-workspace-crates: true
+      # macOS runs no service containers, so the suite's Postgres tests
+      # get a Homebrew postgresql@17: its data directory lives in the
+      # runner's temp, and the URL the suite reads names the database the
+      # step created. Full paths: postgresql@17 is keg-only, so a bare
+      # initdb may be another Postgres the image carries, and GITHUB_PATH
+      # only reaches later steps. The version line proves 17 in the log.
+      - name: postgres on macOS
+        if: runner.os == 'macOS'
+        run: |
+          brew install postgresql@17
+          PG=$(brew --prefix postgresql@17)/bin
+          "$PG/postgres" --version
+          "$PG/initdb" --username=postgres --auth=trust "$RUNNER_TEMP/pgdata"
+          "$PG/pg_ctl" -D "$RUNNER_TEMP/pgdata" -l "$RUNNER_TEMP/pg.log" start
+          "$PG/createdb" -U postgres -h 127.0.0.1 scion
       # The Linux lint job never compiles macOS-only code (the ACL FFI
       # module among it), so clippy runs here, before the tests: same
       # warm cache, a couple of minutes on a job that already builds
@@ -677,6 +692,7 @@ jobs:
         env:
           # A pull request runs 500 cases, main and the nightly 2000.
           PROPTEST_CASES: ${{ github.event_name == 'pull_request' && '500' || '2000' }}
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
       - name: the work tree is still clean after the tests
         run: |
           # New untracked files count too (a stray bench-output.txt);
