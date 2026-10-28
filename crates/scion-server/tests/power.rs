@@ -745,14 +745,6 @@ async fn racing_puts_of_one_blob_survive_a_cut() {
     if !may_run() {
         return;
     }
-    if Backend::test_is_postgres() {
-        // The park that makes the race certain is a SQLite hook: it parks
-        // the store's writer, and the Postgres store has no park. The
-        // blob path of the race is the data directory's, and the cut rows
-        // above prove it; this row stays SQLite-proven.
-        eprintln!("skip on postgres: the write park is a SQLite hook");
-        return;
-    }
     let lazyfs = lazyfs_dir().unwrap();
     let seed = seed();
     let mut rng = Rng::new(seed);
@@ -1006,13 +998,6 @@ async fn checker_writes_outlive_the_lazyfs_exit() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn import_process_races_the_server_on_the_same_blob() {
     if !may_run() {
-        return;
-    }
-    if Backend::test_is_postgres() {
-        // The park that holds the server's writer between keep and rename
-        // is a SQLite hook, and the import beside it opens the data
-        // directory's own database. The row stays SQLite-proven.
-        eprintln!("skip on postgres: the write park is a SQLite hook");
         return;
     }
     let lazyfs = lazyfs_dir().unwrap();
