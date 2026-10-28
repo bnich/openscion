@@ -14,15 +14,15 @@
 
 #![forbid(unsafe_code)]
 
-use crate::error::{Error, Result, from_sqlite};
-use crate::meta::RepoId;
 use crate::Backend;
+use crate::backend::test_hooks::{test_schema, test_url};
+use crate::error::{Result, from_sqlite};
+
+use super::map_pg_error;
+use crate::meta::RepoId;
 use scion_core::ChangesetId;
+use std::fmt::Write as _;
 use std::path::Path;
-
-/// The kind of a derived row.
-pub(crate) type DerivedRow = (String, i64, Vec<u8>, Vec<u8>);
-
 // -- damage: one function per kind -------------------------------------
 
 /// Corrupts the stored body of one changeset: the id stays, the bytes lie.
@@ -128,12 +128,22 @@ pub(crate) fn insert_tree_row(backend: &Backend, id: &[u8], body: &[u8]) -> Resu
 pub(crate) fn delete_repo_membership(backend: &Backend, cs: &ChangesetId) -> Result<()> {
     let data = data_dir(backend);
     if Backend::test_is_postgres() {
+        // `refs` names the membership row: one transaction drops that
+        // key, deletes the row, and puts the key back.
         exec(
             data,
-            &format!("DELETE FROM repo_changesets WHERE cs = {}", pg_bytes(cs.as_bytes())),
+            &format!(
+                "BEGIN;
+                 ALTER TABLE refs DROP CONSTRAINT refs_repo_id_target_fkey;
+                 DELETE FROM repo_changesets WHERE cs = {};
+                 ALTER TABLE refs ADD CONSTRAINT refs_repo_id_target_fkey
+                     FOREIGN KEY (repo_id, target) REFERENCES repo_changesets (repo_id, cs) NOT VALID;
+                 COMMIT;",
+                pg_bytes(cs.as_bytes())
+            ),
         )
     } else {
-        raw_sqlite(data, false, |c| {
+        raw_sqlite(data, true, |c| {
             c.execute(
                 "DELETE FROM repo_changesets WHERE cs = ?1",
                 rusqlite::params![cs.as_bytes()],
@@ -147,7 +157,7 @@ pub(crate) fn delete_repo_membership(backend: &Backend, cs: &ChangesetId) -> Res
 /// schema forbids it, an older build may have made it.
 pub(crate) fn insert_land_row(
     backend: &Backend,
-    repo: crate::RepoId,
+    repo: RepoId,
     request_key: &str,
     target_ref: &str,
     input_cs: &[u8; 32],
@@ -164,7 +174,7 @@ pub(crate) fn insert_land_row(
                  INSERT INTO lands (repo_id, caller, request_key, target_ref, input_cs, state)
                  VALUES ({}, {}, {}, {}, {}, 'pending');
                  ALTER TABLE lands ADD CONSTRAINT lands_input_cs_fkey
-                     FOREIGN KEY (input_cs) REFERENCES changesets (id);
+                     FOREIGN KEY (input_cs) REFERENCES changesets (id) NOT VALID;
                  COMMIT;",
                 repo.0,
                 pg_text("test"),
@@ -204,7 +214,7 @@ pub(crate) fn insert_derived_row(
                  INSERT INTO derived (kind, version, cs, value)
                  VALUES ({}, {}, {}, {});
                  ALTER TABLE derived ADD CONSTRAINT derived_cs_fkey
-                     FOREIGN KEY (cs) REFERENCES changesets (id);
+                     FOREIGN KEY (cs) REFERENCES changesets (id) NOT VALID;
                  COMMIT;",
                 pg_text(kind),
                 version,
@@ -220,31 +230,6 @@ pub(crate) fn insert_derived_row(
             )
         })
         .map(|_| ())
-    }
-}
-
-/// Downgrades every derived row of `kind` to version 0: the shape an
-/// older build left behind, which the next write must remove.
-pub(crate) fn downgrade_derived_rows(backend: &Backend, kind: &str) -> Result<u64> {
-    let data = data_dir(backend);
-    if Backend::test_is_postgres() {
-        exec(
-            data,
-            &format!(
-                "INSERT INTO derived (kind, version, cs, value)
-                 SELECT kind, 0, cs, value FROM derived WHERE kind = {}",
-                pg_text(kind)
-            ),
-        )
-        .map(|_| 0)
-    } else {
-        raw_sqlite(data, false, |c| {
-            c.execute(
-                "INSERT INTO derived (kind, version, cs, value)
-                 SELECT kind, 0, cs, value FROM derived WHERE kind = ?1",
-                rusqlite::params![kind],
-            )
-        })
     }
 }
 
@@ -272,73 +257,15 @@ pub(crate) fn set_derived_value(backend: &Backend, kind: &str, value: &[u8]) -> 
     }
 }
 
-/// Every derived row, as `(kind, version, cs, value)`: what the
-/// derived tests assert about.
-pub(crate) fn derived_rows(backend: &Backend) -> Result<Vec<DerivedRow>> {
-    let data = data_dir(backend);
-    if Backend::test_is_postgres() {
-        let mut client = pg_client(data)?;
-        let rows = client.query(
-            "SELECT kind, version, cs, value FROM derived",
-            &[],
-        )?;
-        Ok(rows
-            .iter()
-            .map(|r| {
-                (
-                    r.get::<_, String>(0),
-                    r.get::<_, i64>(1),
-                    r.get::<_, Vec<u8>>(2),
-                    r.get::<_, Vec<u8>>(3),
-                )
-            })
-            .collect())
-    } else {
-        raw_sqlite(data, false, |c| {
-            let mut rows = Vec::new();
-            let mut stmt = c.prepare("SELECT kind, version, cs, value FROM derived")?;
-            let mapped = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                ))
-            })?;
-            for row in mapped {
-                rows.push(row?);
-            }
-            Ok(rows)
-        })
-    }
-}
-
-/// The id of the first stored tree, when one exists.
-pub(crate) fn first_tree_id(backend: &Backend) -> Result<Option<[u8; 32]>> {
-    let data = data_dir(backend);
-    if Backend::test_is_postgres() {
-        let mut client = pg_client(data)?;
-        let row = client.query_opt("SELECT id FROM trees LIMIT 1", &[])?;
-        Ok(row.map(|r| id_of(&r.get::<_, Vec<u8>>(0))))
-    } else {
-        raw_sqlite(data, false, |c| {
-            let mut stmt = c.prepare("SELECT id FROM trees LIMIT 1")?;
-            let mut rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
-            match rows.next() {
-                Some(row) => Ok(Some(id_of(&row?))),
-                None => Ok(None),
-            }
-        })
-    }
-}
-
 /// The id of the first stored history node, when one exists. A land
 /// stores history nodes, so a landed store has one.
 pub(crate) fn first_history_node_id(backend: &Backend) -> Result<Option<[u8; 32]>> {
     let data = data_dir(backend);
     if Backend::test_is_postgres() {
         let mut client = pg_client(data)?;
-        let row = client.query_opt("SELECT id FROM history_nodes LIMIT 1", &[])?;
+        let row = client
+            .query_opt("SELECT id FROM history_nodes LIMIT 1", &[])
+            .map_err(map_pg_error)?;
         Ok(row.map(|r| id_of(&r.get::<_, Vec<u8>>(0))))
     } else {
         raw_sqlite(data, false, |c| {
@@ -354,12 +281,14 @@ pub(crate) fn first_history_node_id(backend: &Backend) -> Result<Option<[u8; 32]
 
 // -- the two forms ------------------------------------------------------
 
-/// The data directory of a backend: its blob files live one folder in.
+/// The data directory of a backend: its blob files sit two folders
+/// in, under `objects/blob`.
 fn data_dir(backend: &Backend) -> &Path {
     backend
         .blobs()
         .root()
         .parent()
+        .and_then(std::path::Path::parent)
         .expect("the blob root sits in the data directory")
 }
 
@@ -373,7 +302,8 @@ fn raw_sqlite<T>(
 ) -> Result<T> {
     let mut c = rusqlite::Connection::open(data.join("scion.db")).map_err(from_sqlite)?;
     if no_foreign_keys {
-        c.pragma_update(None, "foreign_keys", false).map_err(from_sqlite)?;
+        c.pragma_update(None, "foreign_keys", false)
+            .map_err(from_sqlite)?;
     }
     let out = f(&mut c).map_err(from_sqlite)?;
     drop(c);
@@ -401,7 +331,7 @@ fn pg_client(data: &Path) -> Result<postgres::Client> {
 fn pg_bytes(v: &[u8]) -> String {
     let mut s = String::from("'\\x");
     for b in v {
-        s.push_str(&format!("{b:02x}"));
+        let _ = write!(s, "{b:02x}");
     }
     s.push_str("'::bytea");
     s

@@ -594,7 +594,7 @@ fn id_string(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::backend::Backend;
-    use crate::test_support::damage;
+    use crate::pg::damage;
     use scion_core::{FileState, IdentityTime, RepoPath};
     use std::time::Duration;
     use tempfile::TempDir;
@@ -630,12 +630,8 @@ mod tests {
         store
             .write(|c| {
                 let repo = c.create_repo(REPO)?;
-                let (id, _) = crate::tree::store_changeset(
-                    c,
-                    repo,
-                    cs,
-                    &mut crate::tree::lens_of(&lens),
-                )?;
+                let (id, _) =
+                    crate::tree::store_changeset(c, repo, cs, &mut crate::tree::lens_of(&lens))?;
                 let version = c.get_ref(repo, "main")?.map(|r| r.version);
                 assert!(c.cas_ref(repo, "main", version, id)?);
                 Ok(id)
@@ -815,7 +811,8 @@ mod tests {
             .map(|(id, _)| id.clone())
             .max()
             .expect("the page-two row is whichever id sorts last");
-        damage::corrupt_tree_body(&store, victim.as_bytes(), b"not a tree").unwrap();
+        let victim_id: [u8; 32] = victim.clone().try_into().unwrap();
+        damage::corrupt_tree_body(&store, &victim_id, b"not a tree").unwrap();
         let report = run(&store, 1, &mut |_| {}).unwrap();
         assert!(
             has(&report, "tree-bad", &id_string(&victim)),
@@ -842,7 +839,12 @@ mod tests {
             .unwrap();
         assert!(nodes.len() >= 2, "{} nodes", nodes.len());
         let victim = nodes.into_iter().max().unwrap();
-        damage::corrupt_history_node_body(&store, victim.as_slice().try_into().unwrap(), b"not a node").unwrap();
+        damage::corrupt_history_node_body(
+            &store,
+            victim.as_slice().try_into().unwrap(),
+            b"not a node",
+        )
+        .unwrap();
         let report = run(&store, 1, &mut |_| {}).unwrap();
         assert!(
             has(&report, "history-node-bad", &id_string(&victim)),
@@ -1073,8 +1075,7 @@ mod tests {
     #[test]
     fn a_derived_row_of_an_unknown_version_is_old_not_damage() {
         let (_dir, store, id) = store();
-        damage::insert_derived_row(&store, "root_tree", 9, id.as_bytes(), id.as_bytes())
-            .unwrap();
+        damage::insert_derived_row(&store, "root_tree", 9, id.as_bytes(), id.as_bytes()).unwrap();
         let report = run(&store, 1, &mut |_| {}).unwrap();
         assert!(report.is_clean(), "{:?}", kinds(&report));
         assert_eq!(report.old, BTreeSet::from([("root_tree".to_owned(), 9)]));

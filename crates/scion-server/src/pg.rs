@@ -58,7 +58,7 @@ pub(crate) mod test_hooks;
 /// The damage tests make: one function per kind, each doing the SQLite
 /// or the Postgres form. A child module of `pg` (same as `test_hooks`)
 /// so its Postgres arm can reach this file's error mapping.
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 #[path = "test_support/damage.rs"]
 pub(crate) mod damage;
 
