@@ -1197,12 +1197,20 @@ fn metadata(
 /// directory's own database on SQLite, the store's schema on Postgres.
 fn raw_rows(store: &Backend, schema: Option<&str>, table: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
     if Backend::test_is_postgres() {
-        let mut db = raw_with_schema(schema.expect("postgres mode names a schema"));
-        db.query(&format!("SELECT id, body FROM {table} ORDER BY id"), &[])
-            .expect("the table reads")
-            .iter()
-            .map(|row| (row.get(0), row.get(1)))
-            .collect()
+        let (schema, table) = (schema.map(str::to_string), table.to_string());
+        // The sync client's connect and queries block on the connection's
+        // own runtime, so they cannot run inside a tokio runtime: like
+        // the URL helper, they run on a thread of their own.
+        std::thread::spawn(move || {
+            let mut db = raw_with_schema(&schema.expect("postgres mode names a schema"));
+            db.query(&format!("SELECT id, body FROM {table} ORDER BY id"), &[])
+                .expect("the table reads")
+                .iter()
+                .map(|row| (row.get(0), row.get(1)))
+                .collect::<Vec<(Vec<u8>, Vec<u8>)>>()
+        })
+        .join()
+        .unwrap()
     } else {
         store
             .read(|c| {
