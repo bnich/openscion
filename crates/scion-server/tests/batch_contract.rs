@@ -8,7 +8,7 @@
 
 mod common;
 
-use scion_core::{BlobId, Changeset, FileState, IdentityTime, RepoPath, TreeId};
+use scion_core::{BlobId, Changeset, FileState, IdentityTime, RepoPath};
 use scion_server::Backend;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 
