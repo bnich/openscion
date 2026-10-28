@@ -19,13 +19,15 @@ fn a_batch_that_asks_an_id_twice_answers_it_twice() {
     store
         .write(|c| {
             let repo = c.create_repo("r")?;
-            // One tree row, asked twice in one batch.
-            let tree = TreeId::from_bytes([7; 32]);
-            c.put_trees(&[(tree, b"body".to_vec())])?;
+            // One tree row, asked twice in one batch. The body is a real
+            // tree: put_trees decodes and checks what it stores.
+            let empty = scion_core::Tree::new([].into()).expect("an empty tree fits the format");
+            let (body, tree) = empty.encode_with_id();
+            c.put_trees(&[(tree, body.clone())])?;
             let trees = c.get_trees(&[tree, tree])?;
             assert_eq!(
                 trees,
-                vec![Some(b"body".to_vec()), Some(b"body".to_vec())],
+                vec![Some(body.clone()), Some(body)],
                 "get_trees must answer every asked id"
             );
             // One changeset with a derived row, asked twice in one batch.
