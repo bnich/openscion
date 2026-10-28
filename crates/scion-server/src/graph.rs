@@ -870,14 +870,32 @@ mod tests {
         parents: &[Vec<usize>],
     ) -> (tempfile::TempDir, Backend, RepoId, Vec<ChangesetId>) {
         let dir = crate::test_support::private_tempdir();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::open_test(dir.path()).unwrap();
+        // The same changesets `testing::insert_graph` builds, stored
+        // through the metadata trait, so the graph tests run on the test
+        // backend the environment names, Postgres included.
         let (repo, ids) = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
-                Ok((
-                    repo,
-                    testing::insert_graph(c.sqlite().unwrap(), repo, parents)?,
-                ))
+                let mut ids: Vec<ChangesetId> = Vec::new();
+                for (i, of) in parents.iter().enumerate() {
+                    let path = format!("f{i}");
+                    let state = FileState::Regular {
+                        content: BlobId::of(path.as_bytes()),
+                        executable: false,
+                    };
+                    let cs = Changeset::new(
+                        of.iter().map(|&p| ids[p]).collect(),
+                        IdentityTime::new(b"a".to_vec(), b"a@x".to_vec(), 0, 0)
+                            .expect("identity fits the format"),
+                        None,
+                        path.clone().into_bytes(),
+                        [(RepoPath::new(path).unwrap(), Some(state))].into(),
+                    )
+                    .expect("changeset fits the format");
+                    ids.push(c.insert_changeset(repo, &cs)?);
+                }
+                Ok((repo, ids))
             })
             .unwrap();
         (dir, store, repo, ids)

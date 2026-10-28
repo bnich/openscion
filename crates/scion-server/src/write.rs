@@ -344,7 +344,6 @@ fn check_blobs(
 #[cfg(test)]
 mod tests {
     use crate::backend::Backend;
-    use crate::store::Store;
     use std::collections::BTreeMap;
 
     use scion_core::{FileState, GitOid, IdentityTime};
@@ -377,7 +376,7 @@ mod tests {
     /// A store with repo `main` and an empty root changeset in it.
     fn store_with_root() -> (tempfile::TempDir, Backend, ChangesetId) {
         let dir = crate::test_support::private_tempdir();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::open_test(dir.path()).unwrap();
         let root = store
             .write(|c| {
                 let repo = c.create_repo("main")?;

@@ -220,17 +220,17 @@ impl Backend {
             None
         }
     }
-    /// Write transactions run so far. SQLite only.
+    /// Write transactions run so far, on either backend.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn txes(&self) -> u64 {
         match &self.inner {
             Inner::Sqlite(store) => store.txes(),
-            Inner::Postgres(_) => 0,
+            Inner::Postgres(pg) => pg.txes(),
         }
     }
-    /// Commits made so far. SQLite only: it counts the transactions of the
+    /// Commits made so far, on either backend: the transactions of the
     /// write connection, which is what the tests of the batching watch.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
@@ -238,7 +238,7 @@ impl Backend {
     pub fn commits(&self) -> u64 {
         match &self.inner {
             Inner::Sqlite(store) => store.commits(),
-            Inner::Postgres(_) => 0,
+            Inner::Postgres(pg) => pg.commits(),
         }
     }
     /// The commit count a completed flush last covered, so every commit
@@ -254,13 +254,14 @@ impl Backend {
         }
     }
     /// Sets how many of the next commits of the data directory fail as a
-    /// busy database. A Postgres database has no busy error, so this only
-    /// reaches SQLite.
+    /// busy database, on either backend: the transaction ran and rolled
+    /// back, so the retry re-runs it whole.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn fail_next_commits(&self, n: u32) {
-        if let Inner::Sqlite(store) = &self.inner {
-            store.fail_next_commits(n);
+        match &self.inner {
+            Inner::Sqlite(store) => store.fail_next_commits(n),
+            Inner::Postgres(pg) => pg.fail_next_commits(n),
         }
     }
     /// Sets how long the write connection of the data directory waits for

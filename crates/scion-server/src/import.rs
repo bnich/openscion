@@ -1564,7 +1564,7 @@ mod tests {
             git(dir, &["commit", "-q", "-m", &i.to_string()]);
         }
         let data = crate::test_support::private_tempdir();
-        let store = Backend::sqlite(Store::open(data.path()).unwrap());
+        let store = Backend::open_test(data.path()).unwrap();
         let import = |rev: &str| {
             let opts = ImportOptions {
                 rev: rev.into(),
@@ -1575,14 +1575,18 @@ mod tests {
         };
         import("main~1");
         // As after a version bump of the root tree: no stored root trees.
-        let sql = "DELETE FROM derived WHERE kind = ?1";
-        let removed = store.write(|c| {
-            c.sqlite()
-                .unwrap()
-                .execute(sql, [RootTree::NAME])
-                .map_err(crate::error::from_sqlite)
-        });
-        assert_eq!(removed.unwrap(), 4);
+        // The delete goes through the metadata trait, so the same reset
+        // runs on both backends.
+        let removed = store
+            .write(|c| {
+                c.delete_derived_below(
+                    RootTree::NAME,
+                    RootTree::VERSION.saturating_add(1),
+                    usize::MAX,
+                )
+            })
+            .unwrap();
+        assert_eq!(removed, 4);
 
         let commits = store.commits();
         assert_eq!(import("main").imported, 1);
