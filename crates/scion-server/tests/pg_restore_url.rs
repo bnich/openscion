@@ -50,19 +50,11 @@ fn git_repo(dir: &Path) {
     fs::create_dir_all(dir.join("src")).unwrap();
     fs::write(dir.join("README"), "one\n").unwrap();
     fs::write(dir.join("src/lib.rs"), "fn main() {}\n").unwrap();
-    let steps: [&[&str]; 3] = [
-        &["init", "-q", "-b", "main"],
-        &["add", "-A"],
-        &["commit", "-q", "-m", "one"],
-    ];
-    for args in steps {
-        let mut git = Command::new("git");
-        git.args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .expect("git runs");
-    }
+    // The shared helper: no global git config (the CI runner has no
+    // identity), a fixed author, and a failure on a nonzero exit.
+    common::git(dir, &["init", "-q", "-b", "main"]);
+    common::git(dir, &["add", "-A"]);
+    common::git(dir, &["commit", "-q", "-m", "one"]);
 }
 
 fn import_from_url_file(dir: &Path) -> (PathBuf, PathBuf) {
