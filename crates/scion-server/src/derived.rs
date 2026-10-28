@@ -181,15 +181,13 @@ pub(crate) struct DeriveFlights {
     woken: Condvar,
     /// The cap on walks in flight. Each walk holds the write connection in
     /// turns, so walks beyond the cap only repeat work and starve writes.
-    /// An atomic: production sets it once at open, and the test
-    /// constructor retunes it before any walk flies.
-    walks_cap: std::sync::atomic::AtomicUsize,
+    walks_cap: usize,
     /// The bytes the bounded walks of this store may hold for their
     /// frontiers, as one pool they take from per step. A walk over the
     /// budget stops at its step boundary, and the call answers busy, so a
     /// retry resumes when the budget has room again. The unbounded forms
     /// (fsck, import, the derive command) take none.
-    walk_bytes: std::sync::Mutex<crate::memory::Bytes>,
+    walk_bytes: crate::memory::Bytes,
     /// The operator metrics, set once by the server before it serves:
     /// the walks in flight and the walks in the wait are gauges there.
     /// Empty in import, fsck and gc, which export none.
@@ -202,11 +200,8 @@ impl DeriveFlights {
             flights: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(0),
             woken: Condvar::new(),
-            walks_cap: std::sync::atomic::AtomicUsize::new(walks_cap),
-            walk_bytes: Mutex::new(crate::memory::Bytes::named(
-                DERIVE_WALK_BUDGET,
-                "derive walk",
-            )),
+            walks_cap,
+            walk_bytes: crate::memory::Bytes::named(DERIVE_WALK_BUDGET, "derive walk"),
             metrics: std::sync::OnceLock::new(),
         }
     }
@@ -220,23 +215,21 @@ impl DeriveFlights {
     /// The bytes pool the bounded walks of this store share. Cheap: the
     /// pool is a shared handle.
     pub(crate) fn walk_bytes(&self) -> crate::memory::Bytes {
-        self.walk_bytes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.walk_bytes.clone()
     }
 
-    /// Retunes the cap and the byte budget, for the test constructor that
-    /// opens a backend with non-default flights. Call it before any walk
-    /// of the backend flies: the tests do, at fixture time.
-    #[cfg(test)]
-    pub(crate) fn retune_for_test(&self, walks_cap: usize, walk_bytes: crate::memory::Bytes) {
-        self.walks_cap
-            .store(walks_cap, std::sync::atomic::Ordering::Relaxed);
-        *self
-            .walk_bytes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = walk_bytes;
+    /// A flights set whose bounded walks share `walk_bytes`. For tests of
+    /// the cap and the budget, which use a pool a chain can outgrow.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn with_walk_bytes(walks_cap: usize, walk_bytes: crate::memory::Bytes) -> Self {
+        Self {
+            flights: Mutex::new(HashMap::new()),
+            in_flight: Mutex::new(0),
+            woken: Condvar::new(),
+            walks_cap,
+            walk_bytes,
+            metrics: std::sync::OnceLock::new(),
+        }
     }
 }
 
@@ -281,7 +274,7 @@ fn take_walk_permit<'a>(
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     loop {
-        if *in_flight < walks.walks_cap.load(std::sync::atomic::Ordering::Relaxed) {
+        if *in_flight < walks.walks_cap {
             *in_flight += 1;
             if let Some(metrics) = walks.metrics.get() {
                 metrics.derive_walk_started();
@@ -307,7 +300,7 @@ fn take_walk_permit<'a>(
                 let (guard, result) = walks
                     .woken
                     .wait_timeout_while(in_flight, budget, |in_flight| {
-                        *in_flight >= walks.walks_cap.load(std::sync::atomic::Ordering::Relaxed)
+                        *in_flight >= walks.walks_cap
                     })
                     .unwrap_or_else(PoisonError::into_inner);
                 in_flight = guard;
