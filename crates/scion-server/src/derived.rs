@@ -181,13 +181,15 @@ pub(crate) struct DeriveFlights {
     woken: Condvar,
     /// The cap on walks in flight. Each walk holds the write connection in
     /// turns, so walks beyond the cap only repeat work and starve writes.
-    walks_cap: usize,
+    /// An atomic: production sets it once at open, and the test
+    /// constructor retunes it before any walk flies.
+    walks_cap: std::sync::atomic::AtomicUsize,
     /// The bytes the bounded walks of this store may hold for their
     /// frontiers, as one pool they take from per step. A walk over the
     /// budget stops at its step boundary, and the call answers busy, so a
     /// retry resumes when the budget has room again. The unbounded forms
     /// (fsck, import, the derive command) take none.
-    walk_bytes: crate::memory::Bytes,
+    walk_bytes: std::sync::Mutex<crate::memory::Bytes>,
     /// The operator metrics, set once by the server before it serves:
     /// the walks in flight and the walks in the wait are gauges there.
     /// Empty in import, fsck and gc, which export none.
@@ -200,22 +202,11 @@ impl DeriveFlights {
             flights: Mutex::new(HashMap::new()),
             in_flight: Mutex::new(0),
             woken: Condvar::new(),
-            walks_cap,
-            walk_bytes: crate::memory::Bytes::named(DERIVE_WALK_BUDGET, "derive walk"),
-            metrics: std::sync::OnceLock::new(),
-        }
-    }
-
-    /// A flights set whose bounded walks share `walk_bytes`. For tests of
-    /// the byte budget, which use a pool a chain can outgrow.
-    #[cfg(test)]
-    pub(crate) fn with_walk_bytes(walks_cap: usize, walk_bytes: crate::memory::Bytes) -> Self {
-        Self {
-            flights: Mutex::new(HashMap::new()),
-            in_flight: Mutex::new(0),
-            woken: Condvar::new(),
-            walks_cap,
-            walk_bytes,
+            walks_cap: std::sync::atomic::AtomicUsize::new(walks_cap),
+            walk_bytes: Mutex::new(crate::memory::Bytes::named(
+                DERIVE_WALK_BUDGET,
+                "derive walk",
+            )),
             metrics: std::sync::OnceLock::new(),
         }
     }
@@ -229,7 +220,23 @@ impl DeriveFlights {
     /// The bytes pool the bounded walks of this store share. Cheap: the
     /// pool is a shared handle.
     pub(crate) fn walk_bytes(&self) -> crate::memory::Bytes {
-        self.walk_bytes.clone()
+        self.walk_bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Retunes the cap and the byte budget, for the test constructor that
+    /// opens a backend with non-default flights. Call it before any walk
+    /// of the backend flies: the tests do, at fixture time.
+    #[cfg(test)]
+    pub(crate) fn retune_for_test(&self, walks_cap: usize, walk_bytes: crate::memory::Bytes) {
+        self.walks_cap
+            .store(walks_cap, std::sync::atomic::Ordering::Relaxed);
+        *self
+            .walk_bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = walk_bytes;
     }
 }
 
@@ -274,7 +281,7 @@ fn take_walk_permit<'a>(
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     loop {
-        if *in_flight < walks.walks_cap {
+        if *in_flight < walks.walks_cap.load(std::sync::atomic::Ordering::Relaxed) {
             *in_flight += 1;
             if let Some(metrics) = walks.metrics.get() {
                 metrics.derive_walk_started();
@@ -300,7 +307,7 @@ fn take_walk_permit<'a>(
                 let (guard, result) = walks
                     .woken
                     .wait_timeout_while(in_flight, budget, |in_flight| {
-                        *in_flight >= walks.walks_cap
+                        *in_flight >= walks.walks_cap.load(std::sync::atomic::Ordering::Relaxed)
                     })
                     .unwrap_or_else(PoisonError::into_inner);
                 in_flight = guard;
@@ -1654,25 +1661,18 @@ mod tests {
     /// growth, never more.
     #[test]
     fn a_derive_walk_over_its_byte_budget_stops_busy_and_a_retry_resumes() {
-        // The byte budget is a Store constructor's knob (`Store::
-        // open_with_walk_bytes`); the Postgres backend holds its flights
-        // with the one default cap. This test leaves with the engine.
-        if Backend::test_is_postgres() {
-            return;
-        }
+        let _serial = damage::serial();
         // The walk of a chain of 12 takes six steps (STEP is 2 in tests);
         // the store's budget holds seven steps' worth, and this test holds
         // two of them, as the walks of other callers would.
         let budget = 7 * walk_step_bytes();
         let dir = crate::test_support::private_tempdir();
-        let store = Backend::sqlite(
-            Store::open_with_walk_bytes(
-                dir.path(),
-                DERIVE_WALKS_CAP,
-                crate::memory::Bytes::named(budget, "derive walk"),
-            )
-            .unwrap(),
-        );
+        let store = Backend::open_test_with_walks(
+            dir.path(),
+            DERIVE_WALKS_CAP,
+            crate::memory::Bytes::named(budget, "derive walk"),
+        )
+        .unwrap();
         let (repo, ids) = store.write(|c| store_chain(c, &chain(12))).unwrap();
         let tip = ids[11];
         let held = store
@@ -1718,19 +1718,15 @@ mod tests {
     /// bytes: a history the budget cannot hold still derives.
     #[test]
     fn an_unbounded_derive_walk_takes_no_bytes() {
-        if Backend::test_is_postgres() {
-            return;
-        }
+        let _serial = damage::serial();
         let budget = walk_step_bytes();
         let dir = crate::test_support::private_tempdir();
-        let store = Backend::sqlite(
-            Store::open_with_walk_bytes(
-                dir.path(),
-                DERIVE_WALKS_CAP,
-                crate::memory::Bytes::named(budget, "derive walk"),
-            )
-            .unwrap(),
-        );
+        let store = Backend::open_test_with_walks(
+            dir.path(),
+            DERIVE_WALKS_CAP,
+            crate::memory::Bytes::named(budget, "derive walk"),
+        )
+        .unwrap();
         let (repo, ids) = store.write(|c| store_chain(c, &chain(12))).unwrap();
         assert_eq!(
             get_unbounded::<Ancestry>(&store, repo, ids[11])
@@ -2160,9 +2156,6 @@ mod tests {
 
     #[test]
     fn a_caller_over_the_cap_waits_then_succeeds() {
-        if Backend::test_is_postgres() {
-            return;
-        }
         let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
         COLD_DERIVES.store(0, Ordering::Relaxed);
         // A cap of one walk, and three repos: the first caller walks repo
@@ -2170,12 +2163,17 @@ mod tests {
         // its permit taken. The gate, not a clock, holds it there: the
         // walk's permit stays taken for as long as the test wants.
         let dir = crate::test_support::private_tempdir();
-        let store = Backend::sqlite(Store::open_with_walks(dir.path(), 1).unwrap());
+        let store = Backend::open_test_with_walks(
+            dir.path(),
+            1,
+            crate::memory::Bytes::named(DERIVE_WALK_BUDGET, "derive walk"),
+        )
+        .unwrap();
         let (repo1, ids1) = another_chain(&store, "one", &chain(3));
         let (repo2, ids2) = another_chain(&store, "two", &chain(3));
         let (repo3, ids3) = another_chain(&store, "three", &chain(3));
         let dir2 = crate::test_support::private_tempdir();
-        let store2 = Backend::sqlite(Store::open(dir2.path()).unwrap());
+        let store2 = Backend::open_test(dir2.path()).unwrap();
         let (repo_b, ids_b) = another_chain(&store2, "r", &chain(3));
         let (owner, beside) = std::thread::scope(|scope| {
             let _gate = gate_closed();
@@ -2309,13 +2307,15 @@ mod tests {
 
     #[test]
     fn a_permit_timeout_retires_the_flight() {
-        if Backend::test_is_postgres() {
-            return;
-        }
         let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
         COLD_DERIVES.store(0, Ordering::Relaxed);
         let dir = crate::test_support::private_tempdir();
-        let store = Backend::sqlite(Store::open_with_walks(dir.path(), 1).unwrap());
+        let store = Backend::open_test_with_walks(
+            dir.path(),
+            1,
+            crate::memory::Bytes::named(DERIVE_WALK_BUDGET, "derive walk"),
+        )
+        .unwrap();
         // r2's walk holds the store's only walk permit, parked at the
         // gate. r1's owner then waits for a permit that never comes, and
         // its short deadline fires inside the permit wait — an early `?`
@@ -2454,7 +2454,12 @@ mod tests {
         // transactions on the write connection, and the land would wait
         // behind all of them.
         let dir = crate::test_support::private_tempdir();
-        let store = Backend::sqlite(Store::open_with_walks(dir.path(), 2).unwrap());
+        let store = Backend::open_test_with_walks(
+            dir.path(),
+            2,
+            crate::memory::Bytes::named(DERIVE_WALK_BUDGET, "derive walk"),
+        )
+        .unwrap();
         let mut repos: Vec<(RepoId, ChangesetId)> = Vec::new();
         for i in 0..40 {
             let (repo, ids) = another_chain(&store, &format!("r{i}"), &chain(4));

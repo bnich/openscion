@@ -207,29 +207,6 @@ impl Store {
         Self::open_as(dir, true, &build(), DeriveFlights::new(DERIVE_WALKS_CAP))
     }
 
-    /// Opens or creates a data directory as its server, with a cap of
-    /// `walks` derive walks in flight. For tests of the cap.
-    #[cfg(test)]
-    pub(crate) fn open_with_walks(dir: &Path, walks: usize) -> Result<Self> {
-        Self::open_as(dir, true, &build(), DeriveFlights::new(walks))
-    }
-
-    /// Opens or creates a data directory as its server, with a byte budget
-    /// for its bounded derive walks. For tests of the budget.
-    #[cfg(test)]
-    pub(crate) fn open_with_walk_bytes(
-        dir: &Path,
-        walks: usize,
-        walk_bytes: crate::memory::Bytes,
-    ) -> Result<Self> {
-        Self::open_as(
-            dir,
-            true,
-            &build(),
-            DeriveFlights::with_walk_bytes(walks, walk_bytes),
-        )
-    }
-
     /// Opens or creates a data directory for a process that does not land,
     /// such as `scion-server import`. Any number of shared `Store`s may use
     /// the directory, beside one server `Store`.

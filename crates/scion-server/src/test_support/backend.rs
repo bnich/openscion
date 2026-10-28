@@ -131,6 +131,26 @@ impl Backend {
         refuse_postgres_marker(data)?;
         Self::open(data, None, None)
     }
+    /// Opens the backend that `SCION_TEST_BACKEND` names, with the
+    /// derive walks retuned to `walks` in flight and `walk_bytes` of
+    /// shared budget, for the tests of the walk caps. Both backends
+    /// apply the caps (the Postgres backend builds its flights with the
+    /// default cap); this only changes the numbers.
+    ///
+    /// # Errors
+    ///
+    /// What `open_test` returns.
+    #[doc(hidden)]
+    #[cfg(test)]
+    pub fn open_test_with_walks(
+        data: &Path,
+        walks: usize,
+        walk_bytes: crate::memory::Bytes,
+    ) -> Result<Self> {
+        let backend = Self::open_test(data)?;
+        backend.derive_flights().retune_for_test(walks, walk_bytes);
+        Ok(backend)
+    }
     /// Whether `SCION_TEST_BACKEND` names Postgres. A test that asserts the
     /// rows of the data directory's database skips itself on Postgres: its
     /// assertions are about the SQLite schema, which the schema drift test
