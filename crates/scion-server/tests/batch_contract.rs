@@ -9,8 +9,8 @@
 mod common;
 
 use scion_core::{BlobId, Changeset, FileState, IdentityTime, RepoPath, TreeId};
-use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::Backend;
+use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 
 #[test]
 fn a_batch_that_asks_an_id_twice_answers_it_twice() {
