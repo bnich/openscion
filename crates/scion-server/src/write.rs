@@ -539,6 +539,12 @@ mod tests {
 
     #[test]
     fn a_changeset_makes_its_blobs_durable_before_it_commits() {
+        // The flush count is the SQLite store's durability model; a
+        // Postgres commit is durable when it returns.
+        if Backend::test_is_postgres() {
+            eprintln!("skip on postgres: the flush steps are the SQLite store's");
+            return;
+        }
         let (_dir, store, root) = store_with_root();
         // Backendd by an upload that never synced.
         let mut upload = store.blobs().batch();
