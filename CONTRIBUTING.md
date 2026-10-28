@@ -14,8 +14,11 @@ idea, and agree on the approach before writing a large change.
 ## Development setup
 
 You need Rust 1.88 or newer, `protoc` (the Protocol Buffers compiler, for the
-gRPC code) and `git` (the import tests build small git repositories). For fuzzing you also need a nightly toolchain and
-`cargo-fuzz`.
+gRPC code), `git` (the import tests build small git repositories) and the
+`sqlite3` command-line tool (the backup and restore tests run the
+operations guide's own commands). GitHub's runner images and macOS carry
+`sqlite3`; on Debian or Ubuntu, `apt install sqlite3`. For fuzzing you also
+need a nightly toolchain and `cargo-fuzz`.
 
 ```sh
 git clone https://github.com/bnsd55/openscion
