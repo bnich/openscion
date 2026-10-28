@@ -95,7 +95,7 @@ git clone --depth 1 https://github.com/tokio-rs/tokio /tmp/tokio
 Attack it: `scn` is the client (`./target/release/scn ls main:src` and
 the rest of the README's [quick start](../README.md#quick-start) steps run as
 written); the gRPC surface is behind `SCION_TOKEN=dev` on port 7878;
-the metadata is in Postgres and the blobs are in `/tmp/scion`. The file-mode
+the data directory `/tmp/scion` is SQLite plus blobs. The file-mode
 rules refuse a directory other accounts can write — make one and watch
 the open refuse it. The archive round trip is the fastest path to the
 archive attacks: `scion-server --data /tmp/scion export --all --out

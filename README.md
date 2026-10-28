@@ -23,8 +23,9 @@ Anthropic's
 [Redesigning source control](https://www.anthropic.com/engineering/redesigning-source-control)
 (October 2026). It is not affiliated with or endorsed by Anthropic, and it
 contains no Anthropic code. It is not related to the
-[SCION Internet architecture](https://github.com/scionproto/scion) or to the
-`scion` crate on crates.io.
+[SCION Internet architecture](https://github.com/scionproto/scion), to
+[GoogleCloudPlatform/scion](https://github.com/GoogleCloudPlatform/scion), or
+to the `scion` crate on crates.io.
 
 ## Why
 
@@ -70,20 +71,25 @@ scn land "$cs"                                             # rebase onto main an
 ```
 
 `scn land` exits non-zero on a conflict and prints the paths. A retry of the
-same land returns the first result. Every command takes `--json`.
+same land returns the first result. The interface is text: commands, plain
+files and log lines. Every command takes `--json`, the stable form for
+scripts and assistive tools ([docs/stability.md](docs/stability.md)).
 
 ## Quick start
 
-You need Rust 1.88+, `protoc`, and PostgreSQL 16, 17 or 18. The server keeps
-its metadata in Postgres and the file contents in its data directory.
+You need Rust 1.88+, `protoc` (`brew install protobuf` or
+`apt install protobuf-compiler`) and Docker, or your own PostgreSQL 16-18
+server. The metadata goes to Postgres, and the file contents to the data
+directory.
 
 ```sh
 cargo build --release
 export PATH="$PWD/target/release:$PATH"
+export SCION_TOKEN=dev SCION_SERVER=http://127.0.0.1:7878
 
-# Postgres for the metadata (any 16-18 server works).
+# Postgres for the metadata.
 docker run -d --name scion-pg -p 127.0.0.1:5432:5432 -e POSTGRES_PASSWORD=scion postgres:17
-until docker exec scion-pg pg_isready -q; do sleep 1; done
+until docker exec scion-pg pg_isready -q -h 127.0.0.1; do sleep 1; done
 export SCION_POSTGRES_URL=postgres://postgres:scion@127.0.0.1:5432/postgres
 
 # Import a git repository and start the server.
@@ -92,9 +98,9 @@ install -d -m 0700 /tmp/scion
 scion-server --data /tmp/scion import /tmp/tokio
 scion-server --data /tmp/scion ticket-key --out /tmp/scion/ticket.key > /tmp/scion/ticket.pub
 scion-server --data /tmp/scion serve --ticket-key /tmp/scion/ticket.key &
+until scn log -n 1 >/dev/null 2>&1; do sleep 1; done
 
 # Read, check out, change and land.
-export SCION_TOKEN=dev SCION_SERVER=http://127.0.0.1:7878
 scn log -n 5
 scn cat main:README.md
 scn checkout main --into /tmp/work --sparse tokio/src
@@ -103,11 +109,10 @@ cs=$(scn commit -m "add hello" --put hello.txt=hello.txt)
 scn land "$cs"
 ```
 
-[`scripts/demo.sh`](scripts/demo.sh) runs the same steps on a pinned tokio
-commit and prints the numbers. Every command and flag:
-[docs/cli.md](docs/cli.md). For a real deployment (an access file, TLS, the
-cache tiers, backups and upgrades), read
-[docs/operations.md](docs/operations.md).
+Every `scn` command and flag is in [docs/cli.md](docs/cli.md). The server's
+commands and a real deployment (an access file, TLS, the cache tiers, backups
+and upgrades) are in [docs/operations.md](docs/operations.md). The checkout
+benchmark against git is in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Components
 
@@ -142,9 +147,10 @@ cache tiers, backups and upgrades), read
 
 ## Platforms
 
-Linux (x86-64, arm64) and macOS (Apple Silicon). Windows is not supported.
-PostgreSQL 17 runs on every push, and 16 and 18 run nightly. The exact
-matrix, with the CI job behind each cell: [docs/support.md](docs/support.md).
+Linux on x86-64 and macOS on Apple Silicon are supported. Linux on arm64 is
+best effort. Windows is not supported. CI tests PostgreSQL 16, 17 and 18. The
+exact matrix, with the CI job behind each cell, is in
+[docs/support.md](docs/support.md).
 
 ## Build and test
 
