@@ -23,6 +23,23 @@ use crate::meta::RepoId;
 use scion_core::ChangesetId;
 use std::fmt::Write as _;
 use std::path::Path;
+/// The gate the Postgres tests hold while a fixture is open: one test
+/// at a time against the database, whose connection slots a parallel
+/// suite's writer-plus-readers would exhaust. SQLite has no such bound,
+/// so the lock skips itself there.
+pub(crate) fn serial() -> Option<std::sync::MutexGuard<'static, ()>> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    if Backend::test_is_postgres() {
+        Some(
+            SERIAL
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    } else {
+        None
+    }
+}
+
 // -- damage: one function per kind -------------------------------------
 
 /// Corrupts the stored body of one changeset: the id stays, the bytes lie.
@@ -262,11 +279,12 @@ pub(crate) fn set_derived_value(backend: &Backend, kind: &str, value: &[u8]) -> 
 pub(crate) fn first_history_node_id(backend: &Backend) -> Result<Option<[u8; 32]>> {
     let data = data_dir(backend);
     if Backend::test_is_postgres() {
-        let mut client = pg_client(data)?;
-        let row = client
-            .query_opt("SELECT id FROM history_nodes LIMIT 1", &[])
-            .map_err(map_pg_error)?;
-        Ok(row.map(|r| id_of(&r.get::<_, Vec<u8>>(0))))
+        pg_with(data, |client| {
+            let row = client
+                .query_opt("SELECT id FROM history_nodes LIMIT 1", &[])
+                .map_err(map_pg_error)?;
+            Ok(row.map(|r| id_of(&r.get::<_, Vec<u8>>(0))))
+        })
     } else {
         raw_sqlite(data, false, |c| {
             let mut stmt = c.prepare("SELECT id FROM history_nodes LIMIT 1")?;
@@ -310,21 +328,33 @@ fn raw_sqlite<T>(
     Ok(out)
 }
 
-/// Runs one statement on a raw client of the directory's schema.
-fn exec(data: &Path, sql: &str) -> Result<()> {
-    let mut client = pg_client(data)?;
-    client.batch_execute(sql).map_err(map_pg_error)
+/// The raw client of one schema, kept for the whole test run: every
+/// damage call reuses it, so a parallel suite cannot exhaust the
+/// database's connection slots. The schema of the data directory keys
+/// the cache; one global lock keeps the map itself safe, and the
+/// damage of one call holds it, so damages of one schema never race.
+fn pg_with<T>(data: &Path, f: impl FnOnce(&mut postgres::Client) -> Result<T>) -> Result<T> {
+    static CLIENTS: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<String, postgres::Client>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let schema = test_schema(data);
+    let mut cache = CLIENTS.lock().expect("the client cache never poisons");
+    if !cache.contains_key(&schema) {
+        let mut client =
+            postgres::Client::connect(&test_url()?, postgres::NoTls).map_err(map_pg_error)?;
+        client
+            .batch_execute(&format!("SET search_path = \"{schema}\""))
+            .map_err(map_pg_error)?;
+        cache.insert(schema.clone(), client);
+    }
+    f(cache.get_mut(&schema).unwrap())
 }
 
-/// Opens a raw client on the schema of the data directory: the same
-/// registration the test backend uses, one connection, never pooled.
-fn pg_client(data: &Path) -> Result<postgres::Client> {
-    let mut client =
-        postgres::Client::connect(&test_url()?, postgres::NoTls).map_err(map_pg_error)?;
-    client
-        .batch_execute(&format!("SET search_path = \"{}\"", test_schema(data)))
-        .map_err(map_pg_error)?;
-    Ok(client)
+/// Runs one statement on the raw client of the directory's schema.
+fn exec(data: &Path, sql: &str) -> Result<()> {
+    pg_with(data, |client| {
+        client.batch_execute(sql).map_err(map_pg_error)
+    })
 }
 
 /// A byte string as a Postgres hex literal.
