@@ -2722,14 +2722,14 @@ mod tests {
             (parents, edits) in testing::histories(40),
             room in proptest::option::of(0..4000_usize),
         ) {
-            let _serial = damage::serial();
             // One schema (one data directory) for every case of this test
             // fn, and one repo per case: on Postgres a schema per case
             // would be 64 schemas of one writer and eight readers each.
             static STAGE: std::sync::OnceLock<(tempfile::TempDir, Backend)> =
                 std::sync::OnceLock::new();
             static CASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let (dir, store) = STAGE.get_or_init(|| {
+            let _serial = damage::serial();
+            let (_dir, store) = STAGE.get_or_init(|| {
                 let dir = crate::test_support::private_tempdir();
                 let store = Backend::open_test(dir.path()).unwrap();
                 (dir, store)
