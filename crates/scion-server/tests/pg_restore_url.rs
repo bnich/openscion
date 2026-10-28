@@ -43,15 +43,42 @@ fn write_url_file(data: &Path, file: &Path) {
         .unwrap();
     let sep = if url.contains('?') { '&' } else { '?' };
     fs::write(file, format!("{url}{sep}options=--search_path%3D{schema}")).unwrap();
+    // The URL is a secret: the checked read refuses a file that group
+    // or others can read.
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(file, fs::Permissions::from_mode(0o600)).unwrap();
+    }
 }
 
 /// A store with one repo, made by an import whose URL came from a file:
 /// the same source the restore under test reads.
+fn git_repo(dir: &Path) {
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(dir.join("README"), "one\n").unwrap();
+    fs::write(dir.join("src/lib.rs"), "fn main() {}\n").unwrap();
+    let steps: [&[&str]; 3] = [
+        &["init", "-q", "-b", "main"],
+        &["add", "-A"],
+        &["commit", "-q", "-m", "one"],
+    ];
+    for args in steps {
+        let mut git = Command::new("git");
+        git.args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git runs");
+    }
+}
+
 fn import_from_url_file(dir: &Path) -> (PathBuf, PathBuf) {
     let git = dir.join("git");
-    fs::create_dir_all(git.join("src")).unwrap();
-    fs::write(git.join("src/lib.rs"), "fn main() {}\n").unwrap();
+    git_repo(&git);
     let data = dir.join("source");
+    // The operator makes the data directory (the binary refuses a
+    // missing one); the URL file is made below.
+    scion_proto::runtime::auth::create_private_dir_all(&data).unwrap();
     let url_file = dir.join("pg-url");
     write_url_file(&data, &url_file);
     must_run(
@@ -96,6 +123,8 @@ fn a_restore_with_the_url_from_a_file_lands_in_postgres() {
         &[
             "--data",
             dir.path().join("source").to_str().unwrap(),
+            "--postgres-url-file",
+            url_file.to_str().unwrap(),
             "export",
             "--all",
             "--out",
@@ -105,12 +134,14 @@ fn a_restore_with_the_url_from_a_file_lands_in_postgres() {
     );
 
     let target = dir.path().join("restored");
+    let target_url = dir.path().join("pg-url-restored");
+    write_url_file(&target, &target_url);
     must_run(
         &[
             "--data",
             target.to_str().unwrap(),
             "--postgres-url-file",
-            url_file.to_str().unwrap(),
+            target_url.to_str().unwrap(),
             "restore",
             "--archive",
             out.to_str().unwrap(),
@@ -134,12 +165,13 @@ fn a_restore_with_the_url_from_the_env_lands_in_postgres() {
     }
     let dir = scion_server::test_support::private_tempdir();
     let (data, url_file) = import_from_url_file(dir.path());
-    let env_url = fs::read_to_string(&url_file).unwrap();
     let out = dir.path().join("archive");
     must_run(
         &[
             "--data",
             data.to_str().unwrap(),
+            "--postgres-url-file",
+            url_file.to_str().unwrap(),
             "export",
             "--all",
             "--out",
@@ -149,6 +181,9 @@ fn a_restore_with_the_url_from_the_env_lands_in_postgres() {
     );
 
     let target = dir.path().join("restored");
+    let target_url_path = dir.path().join("pg-url-restored");
+    write_url_file(&target, &target_url_path);
+    let env_url = fs::read_to_string(&target_url_path).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_scion-server"))
         .args([
             "--data",
@@ -190,39 +225,37 @@ fn a_postgres_ca_with_a_url_from_a_file_is_accepted() {
     fs::write(&ca, "not a real CA - never opened without TLS\n").unwrap();
     must_run(
         &[
-            "--data",
-            dir.path().join("probe").to_str().unwrap(),
             "--postgres-url-file",
             url_file.to_str().unwrap(),
             "--postgres-ca",
             ca.to_str().unwrap(),
-            "verify",
-            dir.path().join("nonexistent-archive").to_str().unwrap(),
+            "hash-token",
+            "--token",
+            "t",
         ],
-        "verify with --postgres-ca beside a URL file",
+        "hash-token with --postgres-ca beside a URL file",
     );
 }
 
 /// `--postgres-ca` with NO URL from any source is refused, with the fix
 /// named: the URL can come from three places, and clap saw only one.
+/// `restore` is the command here: its URL is optional until the removal
+/// makes it required, so the refusal must come from the resolution.
 #[test]
 fn a_postgres_ca_without_any_url_is_refused() {
     let dir = scion_server::test_support::private_tempdir();
     let ca = dir.path().join("ca.pem");
     fs::write(&ca, "unopened\n").unwrap();
     let out = run(&[
+        "--data",
+        dir.path().join("target").to_str().unwrap(),
         "--postgres-ca",
         ca.to_str().unwrap(),
-        "verify",
+        "restore",
+        "--archive",
         dir.path().join("nonexistent-archive").to_str().unwrap(),
     ]);
-    assert!(
-        !out.status.success(),
-        "a CA without a URL must be refused"
-    );
+    assert!(!out.status.success(), "a CA without a URL must be refused");
     let why = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        why.contains("--postgres-ca needs a Postgres URL"),
-        "{why}"
-    );
+    assert!(why.contains("--postgres-ca needs a Postgres URL"), "{why}");
 }
