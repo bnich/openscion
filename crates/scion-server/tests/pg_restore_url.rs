@@ -3,10 +3,12 @@
 //! bug this pins: `restore` took the URL from the argv flag only, so a
 //! URL from the file or the environment silently restored into SQLite,
 //! and `--postgres-ca` beside a file or env URL was refused by clap.
-//! These tests need the test database; they skip themselves when
-//! `SCION_TEST_POSTGRES_URL` is not set.
+//! These tests need the test database; they skip themselves when the
+//! environment does not name Postgres as the test backend.
 
 #![cfg(unix)]
+
+mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,17 +34,8 @@ fn must_run(args: &[&str], what: &str) {
 /// The test database URL with `data`'s schema as the search path, the
 /// shape the test harness gives a server, written to `file`.
 fn write_url_file(data: &Path, file: &Path) {
-    let url = std::env::var("SCION_TEST_POSTGRES_URL")
-        .expect("SCION_TEST_POSTGRES_URL must name the test database");
-    let schema = scion_server::Backend::test_schema(data)
-        .expect("postgres mode names a schema for the data directory");
-    let mut client =
-        postgres::Client::connect(&url, postgres::NoTls).expect("the test database connects");
-    client
-        .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
-        .unwrap();
-    let sep = if url.contains('?') { '&' } else { '?' };
-    fs::write(file, format!("{url}{sep}options=--search_path%3D{schema}")).unwrap();
+    let url = common::postgres_url(data);
+    fs::write(file, &url).unwrap();
     // The URL is a secret: the checked read refuses a file that group
     // or others can read.
     {
@@ -103,8 +96,7 @@ fn backend_marker(data: &Path) -> String {
 }
 
 fn skip_without_postgres() -> bool {
-    std::env::var("SCION_TEST_POSTGRES_URL").is_err()
-        || std::env::var("SCION_TEST_BACKEND").as_deref() != Ok("postgres")
+    !scion_server::Backend::test_is_postgres()
 }
 
 /// A restore whose URL comes from `--postgres-url-file` lands in

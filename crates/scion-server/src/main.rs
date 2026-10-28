@@ -820,7 +820,6 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     // `verify` and `restore` run without a store: verify reads only the
-    // archive, and restore makes a data directory of its own. Handle them verify reads only the
     // archive, and restore makes a data directory of its own. Handle them
     // before the store opens, so a restore's empty target stays empty of
     // one, and an archive check opens nothing at all.
