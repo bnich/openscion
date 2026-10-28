@@ -297,6 +297,148 @@ pub(crate) fn first_history_node_id(backend: &Backend) -> Result<Option<[u8; 32]
     }
 }
 
+/// The count of the lands whose state is `landed`.
+pub(crate) fn landed_rows(backend: &Backend) -> Result<i64> {
+    let data = data_dir(backend);
+    if Backend::test_is_postgres() {
+        pg_with(data, |client| {
+            let row = client
+                .query_one("SELECT count(*) FROM lands WHERE state = 'landed'", &[])
+                .map_err(map_pg_error)?;
+            Ok(row.get::<_, i64>(0))
+        })
+    } else {
+        raw_sqlite(data, false, |c| {
+            c.query_row(
+                "SELECT count(*) FROM lands WHERE state = 'landed'",
+                [],
+                |row| row.get(0),
+            )
+        })
+    }
+}
+
+/// The state of the land row of `request_key`.
+pub(crate) fn land_state_by_key(backend: &Backend, key: &str) -> Result<String> {
+    let data = data_dir(backend);
+    if Backend::test_is_postgres() {
+        pg_with(data, |client| {
+            let row = client
+                .query_opt("SELECT state FROM lands WHERE request_key = $1", &[&key])
+                .map_err(map_pg_error)?;
+            Ok(row
+                .map(|r| r.get::<_, String>(0))
+                .expect("the land row exists"))
+        })
+    } else {
+        raw_sqlite(data, false, |c| {
+            c.query_row(
+                "SELECT state FROM lands WHERE request_key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+        })
+    }
+}
+
+/// The state and detail of the land row of `request_key`.
+pub(crate) fn land_state_detail_by_key(backend: &Backend, key: &str) -> Result<(String, String)> {
+    let data = data_dir(backend);
+    if Backend::test_is_postgres() {
+        pg_with(data, |client| {
+            let row = client
+                .query_opt(
+                    "SELECT state, detail FROM lands WHERE request_key = $1",
+                    &[&key],
+                )
+                .map_err(map_pg_error)?;
+            Ok(row
+                .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+                .expect("the land row exists"))
+        })
+    } else {
+        raw_sqlite(data, false, |c| {
+            c.query_row(
+                "SELECT state, detail FROM lands WHERE request_key = ?1",
+                [key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+        })
+    }
+}
+
+/// The count of the land rows of one caller and request key.
+pub(crate) fn land_rows_by_caller_key(backend: &Backend, caller: &str, key: &str) -> Result<i64> {
+    let data = data_dir(backend);
+    if Backend::test_is_postgres() {
+        pg_with(data, |client| {
+            let row = client
+                .query_one(
+                    "SELECT count(*) FROM lands WHERE caller = $1 AND request_key = $2",
+                    &[&caller, &key],
+                )
+                .map_err(map_pg_error)?;
+            Ok(row.get::<_, i64>(0))
+        })
+    } else {
+        raw_sqlite(data, false, |c| {
+            c.query_row(
+                "SELECT count(*) FROM lands WHERE caller = ?1 AND request_key = ?2",
+                [caller, key],
+                |row| row.get(0),
+            )
+        })
+    }
+}
+
+/// Moves the time one land finished `secs` into the past.
+pub(crate) fn age_land(backend: &Backend, land_id: i64, secs: i64) -> Result<()> {
+    let data = data_dir(backend);
+    if Backend::test_is_postgres() {
+        pg_with(data, |client| {
+            client
+                .execute(
+                    "UPDATE lands SET finished_at = finished_at - $2 WHERE land_id = $1",
+                    &[&land_id, &secs],
+                )
+                .map_err(map_pg_error)?;
+            Ok(())
+        })
+    } else {
+        raw_sqlite(data, false, |c| {
+            c.execute(
+                "UPDATE lands SET finished_at = finished_at - ?2 WHERE land_id = ?1",
+                rusqlite::params![land_id, secs],
+            )
+        })
+        .map(|_| ())
+    }
+}
+
+/// Moves the time every pending land was created `secs` into the past.
+pub(crate) fn age_pending_lands(backend: &Backend, secs: i64) -> Result<()> {
+    let data = data_dir(backend);
+    if Backend::test_is_postgres() {
+        pg_with(data, |client| {
+            client
+                .execute(
+                    "UPDATE lands SET created_at = created_at - $1 WHERE state = 'pending'",
+                    &[&secs],
+                )
+                .map_err(map_pg_error)?;
+            Ok(())
+        })
+    } else {
+        raw_sqlite(data, false, |c| {
+            c.execute(
+                "UPDATE lands SET created_at = unixepoch() - ?1 WHERE state = 'pending'",
+                rusqlite::params![secs],
+            )
+        })
+        .map(|_| ())
+    }
+}
+
 // -- the two forms ------------------------------------------------------
 
 /// The data directory of a backend: its blob files sit two folders

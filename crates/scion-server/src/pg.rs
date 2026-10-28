@@ -2777,6 +2777,8 @@ impl MetaTx for PgTx<'_> {
     /// [`Error::NotFound`] if `repo` does not have it, [`Error::Corrupt`]
     /// if it does not decode or match.
     fn get_changeset(&mut self, repo: RepoId, id: ChangesetId) -> Result<Changeset> {
+        #[cfg(test)]
+        crate::db::CHANGESET_READS.set(crate::db::CHANGESET_READS.get() + 1);
         let body: Vec<u8> = self
             .c
             .query_opt(
@@ -3845,6 +3847,14 @@ impl MetaTx for PgTx<'_> {
     ///
     /// [`Error::Corrupt`] if absent or if it does not match its ID.
     fn get_history_node(&mut self, id: NodeId) -> Result<(Vec<u8>, usize)> {
+        #[cfg(test)]
+        if self
+            .history_pending
+            .as_deref()
+            .is_none_or(|pending| !pending.contains_key(id.0.as_slice()))
+        {
+            crate::history::NODE_READS.set(crate::history::NODE_READS.get() + 1);
+        }
         if self.cs_batching
             && let Some(body) = self
                 .history_pending
