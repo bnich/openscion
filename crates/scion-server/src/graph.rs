@@ -870,7 +870,10 @@ mod tests {
         parents: &[Vec<usize>],
     ) -> (tempfile::TempDir, Backend, RepoId, Vec<ChangesetId>) {
         let dir = crate::test_support::private_tempdir();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let store = Backend::open_test(dir.path()).unwrap();
+        // The same changesets `testing::insert_graph` builds, stored
+        // through the metadata trait, so the graph tests run on the test
+        // backend the environment names, Postgres included.
         let (repo, ids) = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
@@ -1407,6 +1410,11 @@ mod tests {
 
     #[test]
     fn a_walk_waits_for_one_flush_for_all_its_steps() {
+        // A Postgres commit is durable when it returns: no flush to count.
+        if Backend::test_is_postgres() {
+            eprintln!("skip on postgres: the flush steps are the SQLite store's");
+            return;
+        }
         let (_dir, store, repo, ids) = store_graph_with_nodes(&ladder(20));
         let (side, tip) = (ids[1], *ids.last().unwrap());
         let mut paint = Paint::new(
