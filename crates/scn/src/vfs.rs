@@ -2537,7 +2537,8 @@ mod tests {
             root,
             &reply.ticket,
             overlay.path().to_path_buf(),
-        );
+        )
+        .unwrap();
         let blob = BlobId::of(b"x\n");
         let (a, b) = tokio::join!(vfs.fetch_blob(blob, None, 2), vfs.fetch_blob(blob, None, 2));
         assert_eq!(*a.unwrap(), b"x\n");
