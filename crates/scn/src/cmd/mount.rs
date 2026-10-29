@@ -911,6 +911,47 @@ mod silent_failures {
         }
     }
 
+    /// A path is bytes: a directory and an overlay whose names are not
+    /// UTF-8 come back exactly from the session file, so `scn unmount`
+    /// finds the record. A UTF-8 path is written as before, with no
+    /// `_b64` sibling, and a record without one still reads.
+    #[test]
+    fn a_path_that_is_not_utf8_round_trips_through_the_session_file() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let base = tempfile::tempdir().unwrap();
+        let file = base.path().join("mounts.json");
+        let odd = MountRecord {
+            dir: base.path().join(std::ffi::OsStr::from_bytes(b"m\xff")),
+            overlay: base.path().join(std::ffi::OsStr::from_bytes(b"o\xfe")),
+            rev: "main".to_owned(),
+            pid: 1,
+            writable: false,
+        };
+        add_session(&file, &odd).unwrap();
+        assert_eq!(read_sessions(&file).unwrap(), vec![odd.clone()]);
+        assert!(
+            drop_session(&file, &odd.dir).unwrap().is_some(),
+            "scn unmount finds no mount"
+        );
+
+        let plain = record("/mnt/view", 7);
+        add_session(&file, &plain).unwrap();
+        let text = fs::read_to_string(&file).unwrap();
+        assert!(
+            !text.contains("_b64"),
+            "a UTF-8 path grew a sibling: {text}"
+        );
+        fs::write(
+            &file,
+            r#"[{"dir":"/mnt/view","overlay":"/tmp/o","rev":"main","pid":7,"writable":false}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_sessions(&file).unwrap()[0].dir,
+            PathBuf::from("/mnt/view")
+        );
+    }
+
     /// A kill that cannot signal a live process keeps the record, so a
     /// retry of the unmount finds the mount again.
     #[test]
@@ -1163,47 +1204,6 @@ mod silent_failures {
         let found = read_sessions(&file).unwrap();
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].dir, PathBuf::from("/mnt/view"));
-    }
-
-    /// A path is bytes: a directory and an overlay whose names are not
-    /// UTF-8 come back exactly from the session file, so `scn unmount`
-    /// finds the record. A UTF-8 path is written as before, with no
-    /// `_b64` sibling, and a record without one still reads.
-    #[test]
-    fn a_path_that_is_not_utf8_round_trips_through_the_session_file() {
-        use std::os::unix::ffi::OsStrExt as _;
-        let base = tempfile::tempdir().unwrap();
-        let file = base.path().join("mounts.json");
-        let odd = MountRecord {
-            dir: base.path().join(std::ffi::OsStr::from_bytes(b"m\xff")),
-            overlay: base.path().join(std::ffi::OsStr::from_bytes(b"o\xfe")),
-            rev: "main".to_owned(),
-            pid: 1,
-            writable: false,
-        };
-        add_session(&file, &odd).unwrap();
-        assert_eq!(read_sessions(&file).unwrap(), vec![odd.clone()]);
-        assert!(
-            drop_session(&file, &odd.dir).unwrap().is_some(),
-            "scn unmount finds no mount"
-        );
-
-        let plain = record("/mnt/view", 7);
-        add_session(&file, &plain).unwrap();
-        let text = fs::read_to_string(&file).unwrap();
-        assert!(
-            !text.contains("_b64"),
-            "a UTF-8 path grew a sibling: {text}"
-        );
-        fs::write(
-            &file,
-            r#"[{"dir":"/mnt/view","overlay":"/tmp/o","rev":"main","pid":7,"writable":false}]"#,
-        )
-        .unwrap();
-        assert_eq!(
-            read_sessions(&file).unwrap()[0].dir,
-            PathBuf::from("/mnt/view")
-        );
     }
 
     /// Waits until `cond` holds, with a ceiling: macOS may keep a reaped
