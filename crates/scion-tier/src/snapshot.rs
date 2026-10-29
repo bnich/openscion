@@ -584,7 +584,7 @@ mod tests {
     /// skipped, not stored.
     #[test]
     fn a_seed_that_overflows_the_limit_counts_what_the_store_keeps() {
-        let dir = private_dir();
+        let dir = crate::private_tempdir();
         let first = blob(b"aa");
         let second = blob(&vec![b'x'; 4096]);
         let path = dir.path().join("r.scnsnap");
